@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PC: build + test",
+      "type": "shell",
+      "command": "make -C micropython/ports/unix USER_C_MODULES=$HOME/xpython/modules && micropython/ports/unix/build-standard/micropython tests/test_xcrypto.py",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "ESP32: build + flash",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=ESP32_GENERIC USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyUSB0 deploy",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "ESP32: run tests",
+      "type": "shell",
+      "command": "mpremote connect /dev/ttyUSB0 run tests/test_xcrypto.py",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}
