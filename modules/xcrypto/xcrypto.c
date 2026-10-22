@@ -5,11 +5,12 @@
 #include "mbedtls/md.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/ecdsa.h"
+#include "xcrypto.h"
 
 #define XCRYPTO_VERSION "1.0.0"
 
-// ---------- Random source: different for each platform ----------
 // ---------- Platform: random source + hardware info ----------
+// ---------- Random source: different for each platform ----------
 #if defined(XCRYPTO_ESP32) || defined(ESP_PLATFORM) || __has_include("esp_random.h")
 #include "esp_random.h"
 #include "sdkconfig.h"
@@ -24,7 +25,7 @@
 #if defined(CONFIG_MBEDTLS_HARDWARE_MPI)
 #define XC_HW_MPI 1
 #endif
-static void xc_fill_random(uint8_t *buf, size_t len) {
+void xc_fill_random(uint8_t *buf, size_t len) {
     esp_fill_random(buf, len);              // ESP32 hardware RNG
 }
 #elif defined(__unix__)
@@ -32,7 +33,7 @@ static void xc_fill_random(uint8_t *buf, size_t len) {
 #include <sys/random.h>
 #define XC_PLATFORM "unix"
 #define XC_HW_RNG 0
-static void xc_fill_random(uint8_t *buf, size_t len) {
+void xc_fill_random(uint8_t *buf, size_t len) {
     size_t done = 0;
     while (done < len) {                    // Linux kernel RNG
         ssize_t n = getrandom(buf + done, len - done, 0);
@@ -456,3 +457,73 @@ const mp_obj_module_t xcrypto_module = {
     .globals = (mp_obj_dict_t *)&xcrypto_globals,
 };
 MP_REGISTER_MODULE(MP_QSTR_xcrypto, xcrypto_module);
+
+// ========== C helpers for other modules (declared in xcrypto.h) ==========
+int xc_ecdsa_keygen(uint8_t priv[32], uint8_t pub[65]) {
+    mbedtls_ecp_group grp;
+    mbedtls_mpi d;
+    mbedtls_ecp_point Q;
+    size_t olen = 0;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_mpi_init(&d);
+    mbedtls_ecp_point_init(&Q);
+    int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    if (ret == 0) {
+        ret = mbedtls_ecp_gen_keypair(&grp, &d, &Q, xc_rng, NULL);
+    }
+    if (ret == 0) {
+        ret = mbedtls_mpi_write_binary(&d, priv, 32);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pub, 65);
+    }
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_group_free(&grp);
+    return ret;
+}
+
+int xc_ecdsa_sign_hash(const uint8_t priv[32], const uint8_t hash[32], uint8_t sig[64]) {
+    mbedtls_ecp_group grp;
+    mbedtls_mpi d, r, s;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_mpi_init(&d);
+    mbedtls_mpi_init(&r);
+    mbedtls_mpi_init(&s);
+    int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    if (ret == 0) {
+        ret = mbedtls_mpi_read_binary(&d, priv, 32);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecdsa_sign(&grp, &r, &s, &d, hash, 32, xc_rng, NULL);
+    }
+    if (ret == 0) {
+        ret = mbedtls_mpi_write_binary(&r, sig, 32);
+    }
+    if (ret == 0) {
+        ret = mbedtls_mpi_write_binary(&s, sig + 32, 32);
+    }
+    mbedtls_mpi_free(&s);
+    mbedtls_mpi_free(&r);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_group_free(&grp);
+    return ret;
+}
+
+int xc_aes_gcm(int encrypt, const uint8_t key[32], const uint8_t iv[12],
+               const uint8_t *aad, size_t aad_len,
+               const uint8_t *in, size_t len, uint8_t *out, uint8_t tag[16]) {
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (ret == 0) {
+        if (encrypt) {
+            ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, len, iv, 12,
+                aad, aad_len, in, out, 16, tag);
+        } else {
+            ret = mbedtls_gcm_auth_decrypt(&gcm, len, iv, 12, aad, aad_len, tag, 16, in, out);
+        }
+    }
+    mbedtls_gcm_free(&gcm);
+    return ret;
+}

@@ -4,7 +4,7 @@
     {
       "label": "PC: build + test",
       "type": "shell",
-      "command": "make -C micropython/ports/unix USER_C_MODULES=$HOME/xpython/modules && micropython/ports/unix/build-standard/micropython tests/test_xcrypto.py",
+      "command": "make -C micropython/ports/unix USER_C_MODULES=$HOME/xpython/modules && for t in tests/test_*.py; do micropython/ports/unix/build-standard/micropython $t || exit 1; done",
       "options": { "cwd": "${workspaceFolder}" },
       "group": { "kind": "build", "isDefault": true },
       "problemMatcher": ["$gcc"]
@@ -19,8 +19,7 @@
     {
       "label": "ESP32: run tests",
       "type": "shell",
-      "command": "mpremote connect /dev/ttyUSB0 run tests/test_xcrypto.py",
-      "options": { "cwd": "${workspaceFolder}" },
+      "command": "for t in tests/test_*.py; do mpremote connect /dev/ttyUSB0 run $t || exit 1; done",      "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     }
   ]
