@@ -8,6 +8,8 @@ for label in ("t_aes", "t_ecc"):          # clean up after an earlier failed run
 xkeys.generate("t_aes", xkeys.AES256)
 xkeys.generate("t_ecc", xkeys.ECC_P256)
 assert xkeys.exists("t_aes") and xkeys.exists("t_ecc")
+labels = xkeys.list()
+assert "t_aes" in labels and "t_ecc" in labels
 
 # An existing key can't be overwritten
 try:

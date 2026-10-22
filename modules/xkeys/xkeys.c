@@ -3,7 +3,7 @@
 #include "mbedtls/sha256.h"
 #include "xcrypto.h"
 
-#define XKEYS_VERSION "0.1.0"
+#define XKEYS_VERSION "0.2.0"
 #define XK_AES256    1
 #define XK_ECC_P256  2
 #define XK_LABEL_MAX 15                 // NVS name limit
@@ -11,7 +11,66 @@
 
 // ========== Storage backend ==========
 #if defined(ESP_PLATFORM) || __has_include("esp_random.h")
-#include "nvs.h"                        // ESP32: flash key-value store
+#include "nvs.h"  
+#include "sdkconfig.h"
+#include "esp_wifi.h"
+#if __has_include("bootloader_random.h")
+#include "bootloader_random.h"
+#define XK_HAVE_BOOT_RANDOM 1
+#endif
+#if defined(CONFIG_BT_ENABLED) && __has_include("esp_bt.h")
+#include "esp_bt.h"
+#define XK_HAVE_BT 1
+#endif
+
+// True if Wi-Fi or Bluetooth is running: their radio noise already makes the RNG truly random
+static bool radio_on(void) {
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) == ESP_OK && mode != WIFI_MODE_NULL) {
+        return true;
+    }
+#if XK_HAVE_BT
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+// Switch on the hardware noise source for key generation if no radio is running.
+// Returns 1 if it was switched on, so entropy_end knows to switch it off.
+static int entropy_begin(void) {
+#if XK_HAVE_BOOT_RANDOM
+    if (!radio_on()) {
+        bootloader_random_enable();
+        return 1;
+    }
+#endif
+    return 0;
+}
+static void entropy_end(int enabled) {
+#if XK_HAVE_BOOT_RANDOM
+    if (enabled) {
+        bootloader_random_disable();
+    }
+#endif
+    (void)enabled;
+}
+
+// list of all key labels in the "xkeys" namespace
+static mp_obj_t store_list(void) {
+    mp_obj_t result = mp_obj_new_list(0, NULL);
+    nvs_iterator_t it = NULL;
+    esp_err_t e = nvs_entry_find("nvs", "xkeys", NVS_TYPE_BLOB, &it);
+    while (e == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        mp_obj_list_append(result, mp_obj_new_str(info.key, strlen(info.key)));
+        e = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    return result;
+}                      // ESP32: flash key-value store
 static int store_put(const char *label, const uint8_t *blob, size_t len) {
     nvs_handle_t h;
     if (nvs_open("xkeys", NVS_READWRITE, &h) != ESP_OK) {
@@ -93,6 +152,21 @@ static int store_del(const char *label) {
     memset(&slots[i], 0, sizeof(slots[i]));
     return 0;
 }
+static int entropy_begin(void) {
+    return 0;
+}
+static void entropy_end(int enabled) {
+    (void)enabled;
+}
+static mp_obj_t store_list(void) {
+    mp_obj_t result = mp_obj_new_list(0, NULL);
+    for (int i = 0; i < XK_SLOTS; i++) {
+        if (slots[i].len) {
+            mp_obj_list_append(result, mp_obj_new_str(slots[i].label, strlen(slots[i].label)));
+        }
+    }
+    return result;
+}
 #endif
 
 // ========== Helpers ==========
@@ -127,28 +201,32 @@ static MP_DEFINE_CONST_FUN_OBJ_0(xkeys_version_obj, xkeys_version);
 static mp_obj_t xkeys_generate(mp_obj_t label_in, mp_obj_t type_in) {
     const char *label = get_label(label_in);
     mp_int_t type = mp_obj_get_int(type_in);
+    if (type != XK_AES256 && type != XK_ECC_P256) {
+        mp_raise_ValueError(MP_ERROR_TEXT("unknown key type"));
+    }
     uint8_t blob[XK_BLOB_MAX];
     size_t len = sizeof(blob);
     if (store_get(label, blob, &len) == 0) {
         memset(blob, 0, sizeof(blob));
         mp_raise_ValueError(MP_ERROR_TEXT("key already exists"));
     }
-    int ret;
+
+    int ret = 0;
     blob[0] = (uint8_t)type;
+    int ent = entropy_begin();              // true randomness on
     if (type == XK_AES256) {
         xc_fill_random(blob + 1, 32);
         len = 1 + 32;
-        ret = 0;
-    } else if (type == XK_ECC_P256) {
+    } else {
         ret = xc_ecdsa_keygen(blob + 1, blob + 33);
         len = 1 + 32 + 65;
-    } else {
-        mp_raise_ValueError(MP_ERROR_TEXT("unknown key type"));
     }
+    entropy_end(ent);                       // and off again
+
     if (ret == 0) {
         ret = store_put(label, blob, len);
     }
-    memset(blob, 0, sizeof(blob));      // wipe the key from RAM
+    memset(blob, 0, sizeof(blob));
     if (ret != 0) {
         mp_raise_ValueError(MP_ERROR_TEXT("key generation failed"));
     }
@@ -174,6 +252,12 @@ static mp_obj_t xkeys_delete(mp_obj_t label_in) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(xkeys_delete_obj, xkeys_delete);
+
+// list() -> list of key labels
+static mp_obj_t xkeys_list(void) {
+    return store_list();
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(xkeys_list_obj, xkeys_list);
 
 // public(label) -> 65-byte public key (ECC only)
 static mp_obj_t xkeys_public(mp_obj_t label_in) {
@@ -268,6 +352,7 @@ static const mp_rom_map_elem_t xkeys_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_sign),     MP_ROM_PTR(&xkeys_sign_obj) },
     { MP_ROM_QSTR(MP_QSTR_encrypt),  MP_ROM_PTR(&xkeys_encrypt_obj) },
     { MP_ROM_QSTR(MP_QSTR_decrypt),  MP_ROM_PTR(&xkeys_decrypt_obj) },
+    { MP_ROM_QSTR(MP_QSTR_list),     MP_ROM_PTR(&xkeys_list_obj) },
 };
 static MP_DEFINE_CONST_DICT(xkeys_globals, xkeys_globals_table);
 
