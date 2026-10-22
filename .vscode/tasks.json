@@ -12,7 +12,7 @@
     {
       "label": "ESP32: build + flash",
       "type": "shell",
-      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=ESP32_GENERIC USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyUSB0 deploy",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyUSB0 deploy",
       "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
       "problemMatcher": ["$gcc"]
     },
