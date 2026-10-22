@@ -7,7 +7,7 @@
 #include "mbedtls/ecdsa.h"
 #include "xcrypto.h"
 
-#define XCRYPTO_VERSION "1.0.0"
+#define XCRYPTO_VERSION "1.1.0"
 
 // ---------- Platform: random source + hardware info ----------
 // ---------- Random source: different for each platform ----------
@@ -525,5 +525,52 @@ int xc_aes_gcm(int encrypt, const uint8_t key[32], const uint8_t iv[12],
         }
     }
     mbedtls_gcm_free(&gcm);
+    return ret;
+}
+int xc_ecdsa_verify_hash(const uint8_t pub[65], const uint8_t hash[32], const uint8_t sig[64]) {
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_point Q;
+    mbedtls_mpi r, s;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_ecp_point_init(&Q);
+    mbedtls_mpi_init(&r);
+    mbedtls_mpi_init(&s);
+    int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    if (ret == 0) {
+        ret = mbedtls_ecp_point_read_binary(&grp, &Q, pub, 65);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecp_check_pubkey(&grp, &Q);
+    }
+    if (ret == 0) {
+        ret = mbedtls_mpi_read_binary(&r, sig, 32);
+    }
+    if (ret == 0) {
+        ret = mbedtls_mpi_read_binary(&s, sig + 32, 32);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecdsa_verify(&grp, hash, 32, &Q, &r, &s);
+    }
+    mbedtls_mpi_free(&s);
+    mbedtls_mpi_free(&r);
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_ecp_group_free(&grp);
+    return ret;
+}
+
+int xc_ecdsa_check_public(const uint8_t pub[65]) {
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_ecp_point_init(&Q);
+    int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    if (ret == 0) {
+        ret = mbedtls_ecp_point_read_binary(&grp, &Q, pub, 65);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecp_check_pubkey(&grp, &Q);   // is it really a point on the curve?
+    }
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_ecp_group_free(&grp);
     return ret;
 }

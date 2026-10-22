@@ -2,8 +2,9 @@
 #include "py/runtime.h"
 #include "mbedtls/sha256.h"
 #include "xcrypto.h"
+#include "xkeys.h"
 
-#define XKEYS_VERSION "0.2.0"
+#define XKEYS_VERSION "0.3.0"
 #define XK_AES256    1
 #define XK_ECC_P256  2
 #define XK_LABEL_MAX 15                 // NVS name limit
@@ -104,6 +105,19 @@ static int store_del(const char *label) {
     nvs_close(h);
     return e == ESP_OK ? 0 : -1;
 }
+
+static int store_wipe(void) {
+    nvs_handle_t h;
+    if (nvs_open("xkeys", NVS_READWRITE, &h) != ESP_OK) {
+        return -1;
+    }
+    esp_err_t e = nvs_erase_all(h);
+    if (e == ESP_OK) {
+        e = nvs_commit(h);
+    }
+    nvs_close(h);
+    return e == ESP_OK ? 0 : -1;
+}
 #else
 // PC build: keys in RAM only, lost when the program exits (testing only)
 #define XK_SLOTS 8
@@ -152,6 +166,10 @@ static int store_del(const char *label) {
     memset(&slots[i], 0, sizeof(slots[i]));
     return 0;
 }
+static int store_wipe(void) {
+    memset(slots, 0, sizeof(slots));
+    return 0;
+}
 static int entropy_begin(void) {
     return 0;
 }
@@ -197,43 +215,63 @@ static mp_obj_t xkeys_version(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(xkeys_version_obj, xkeys_version);
 
-// generate(label, type)
-static mp_obj_t xkeys_generate(mp_obj_t label_in, mp_obj_t type_in) {
-    const char *label = get_label(label_in);
-    mp_int_t type = mp_obj_get_int(type_in);
-    if (type != XK_AES256 && type != XK_ECC_P256) {
-        mp_raise_ValueError(MP_ERROR_TEXT("unknown key type"));
-    }
-    uint8_t blob[XK_BLOB_MAX];
-    size_t len = sizeof(blob);
-    if (store_get(label, blob, &len) == 0) {
-        memset(blob, 0, sizeof(blob));
-        mp_raise_ValueError(MP_ERROR_TEXT("key already exists"));
-    }
+   // ---- C interface (xkeys.h) ----
+   int xk_generate(const char *label, int type) {
+       if (type != XK_AES256 && type != XK_ECC_P256) {
+           return -2;
+       }
+       uint8_t blob[XK_BLOB_MAX];
+       size_t len = sizeof(blob);
+       if (store_get(label, blob, &len) == 0) {
+           memset(blob, 0, sizeof(blob));
+           return -1;
+       }
+       int ret = 0;
+       blob[0] = (uint8_t)type;
+       int ent = entropy_begin();
+       if (type == XK_AES256) {
+           xc_fill_random(blob + 1, 32);
+           len = 1 + 32;
+       } else {
+           ret = xc_ecdsa_keygen(blob + 1, blob + 33);
+           len = 1 + 32 + 65;
+       }
+       entropy_end(ent);
+       if (ret == 0) {
+           ret = store_put(label, blob, len);
+       }
+       memset(blob, 0, sizeof(blob));
+       return ret == 0 ? 0 : -3;
+   }
 
-    int ret = 0;
-    blob[0] = (uint8_t)type;
-    int ent = entropy_begin();              // true randomness on
-    if (type == XK_AES256) {
-        xc_fill_random(blob + 1, 32);
-        len = 1 + 32;
-    } else {
-        ret = xc_ecdsa_keygen(blob + 1, blob + 33);
-        len = 1 + 32 + 65;
-    }
-    entropy_end(ent);                       // and off again
+   int xk_public(const char *label, uint8_t pub[65]) {
+       uint8_t blob[XK_BLOB_MAX];
+       size_t len = sizeof(blob);
+       int ok = store_get(label, blob, &len) == 0 && blob[0] == XK_ECC_P256;
+       if (ok) {
+           memcpy(pub, blob + 33, 65);
+       }
+       memset(blob, 0, sizeof(blob));
+       return ok ? 0 : -1;
+   }
 
-    if (ret == 0) {
-        ret = store_put(label, blob, len);
-    }
-    memset(blob, 0, sizeof(blob));
-    if (ret != 0) {
-        mp_raise_ValueError(MP_ERROR_TEXT("key generation failed"));
-    }
-    return mp_const_none;
-}
-static MP_DEFINE_CONST_FUN_OBJ_2(xkeys_generate_obj, xkeys_generate);
+   int xk_wipe_all(void) {
+       return store_wipe();
+   }
 
+   // ---- Python: generate(label, type) ----
+   static mp_obj_t xkeys_generate(mp_obj_t label_in, mp_obj_t type_in) {
+       int r = xk_generate(get_label(label_in), mp_obj_get_int(type_in));
+       if (r == -1) {
+           mp_raise_ValueError(MP_ERROR_TEXT("key already exists"));
+       } else if (r == -2) {
+           mp_raise_ValueError(MP_ERROR_TEXT("unknown key type"));
+       } else if (r != 0) {
+           mp_raise_ValueError(MP_ERROR_TEXT("key generation failed"));
+       }
+       return mp_const_none;
+   }
+   static MP_DEFINE_CONST_FUN_OBJ_2(xkeys_generate_obj, xkeys_generate);
 // exists(label) -> bool
 static mp_obj_t xkeys_exists(mp_obj_t label_in) {
     uint8_t blob[XK_BLOB_MAX];
