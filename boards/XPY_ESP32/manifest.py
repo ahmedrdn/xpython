@@ -1,0 +1,2 @@
+include("$(PORT_DIR)/boards/manifest.py")
+module("xsfs.py", base_path="$(BOARD_DIR)/../../frozen")
