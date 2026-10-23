@@ -1,18 +1,25 @@
 # xloader: xPython Secure Loader (frozen into the firmware).
-# Installs and runs only app packages signed with the device's "app" anchor.
+# Installs and runs only app packages signed with the device's "app" anchor,
+# and runs each app under its manifest's permissions (enforced by xpolicy).
 import os
 import sys
 import json
 import struct
+import builtins
 import xcrypto
 import xinit
+import xkeys
+import xpolicy
+import xsfs
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MAGIC = b"XPK1"
 SIG_LABEL = b"xpy-app-v1"
 MAX_PACKAGE = 64 * 1024
 RESERVED = ("manifest.json", "manifest.sig")
 _root = "/apps"
+_real_open = open                 # saved before any app policy is active
+_real_import = __import__
 
 
 def version():
@@ -59,6 +66,27 @@ def _parse_version(v):
     if len(parts) != 3:
         raise ValueError("version must be x.y.z")
     return tuple(int(x) for x in parts)
+
+
+def _check_permissions(p):
+    if not isinstance(p, dict):
+        raise ValueError("bad permissions")
+    fs = p.get("fs", {})
+    if not isinstance(fs, dict):
+        raise ValueError("bad fs permission")
+    for kind in ("read", "write"):
+        for path in fs.get(kind, []):
+            if not isinstance(path, str) or not path.startswith("/") or ".." in path:
+                raise ValueError("bad path in permissions: " + str(path))
+    for kind in ("keys", "modules"):
+        for item in p.get(kind, []):
+            if not isinstance(item, str):
+                raise ValueError("bad " + kind + " in permissions")
+
+
+def _data_key(app):
+    """Label of the app's private storage key (xkeys labels max 15 chars)."""
+    return "a_" + xcrypto.sha256(app.encode()).hex()[:12]
 
 
 # ---------- Package parsing and checks ----------
@@ -108,8 +136,7 @@ def _verify(manifest, sig):
         _check_name(name)
     if m["entry"] not in m["files"]:
         raise ValueError("entry file missing")
-    if not isinstance(m["permissions"], dict):
-        raise ValueError("bad permissions")
+    _check_permissions(m["permissions"])
     return m
 
 
@@ -119,6 +146,39 @@ def _check_files(m, files):
     for name, data in files.items():
         if xcrypto.sha256(data).hex() != m["files"][name]:
             raise ValueError("hash mismatch: " + name)
+
+
+# ---------- Policy and private data ----------
+def _policy(app, m):
+    """Turn the manifest's permissions into the dict xpolicy enforces."""
+    # Note: this file defines its own list(), so copies are made with [x for x in ...]
+    p = m["permissions"]
+    fs = p.get("fs", {})
+    modules = [n.rsplit(".", 1)[0] for n in m["files"]] + [x for x in p.get("modules", [])]
+    if p.get("keys"):
+        modules.append("xkeys")
+    return {
+        "app": app,
+        "modules": modules,
+        "read": [x for x in fs.get("read", [])],
+        "write": [x for x in fs.get("write", [])] + ["/data"],   # its private folder
+        "keys": [x for x in p.get("keys", [])] + [_data_key(app)],
+    }
+
+
+def _mount_data(app):
+    base = _root + "/.data"
+    if not _exists(base):
+        os.mkdir(base)
+    _umount_data()
+    xsfs.mount("/data", key=_data_key(app), root=base + "/" + app)
+
+
+def _umount_data():
+    try:
+        os.umount("/data")
+    except OSError:
+        pass
 
 
 # ---------- Public functions ----------
@@ -139,7 +199,6 @@ def install(path):
     if old and _parse_version(m["version"]) <= _parse_version(old["version"]):
         raise ValueError("version must be newer than " + old["version"])
 
-    # Unpack into a staging folder first
     if not _exists(_root):
         os.mkdir(_root)
     stage = _root + "/.stage"
@@ -153,7 +212,6 @@ def install(path):
     with open(stage + "/manifest.sig", "wb") as f:
         f.write(sig)
 
-    # Swap it into place
     dest = _root + "/" + app
     old_dir = _root + "/.old"
     _rmtree(old_dir)
@@ -181,10 +239,14 @@ def list():
 
 
 def remove(app):
+    """Uninstall an app, and delete its private data and data key."""
     _check_name(app)
     if info(app) is None:
         raise ValueError("app not installed: " + app)
     _rmtree(_root + "/" + app)
+    _rmtree(_root + "/.data/" + app)
+    if xkeys.exists(_data_key(app)):
+        xkeys.delete(_data_key(app))
 
 
 def verify(app):
@@ -207,17 +269,27 @@ def verify(app):
 
 
 def run(app):
-    """Verify the app, import its entry file, and return main()'s result."""
+    """Verify the app, then run its main() under its own policy."""
+    if xpolicy.active() is not None:                                  # NEW
+        raise ValueError("another app is running: " + xpolicy.active())
     m = verify(app)
     d = _root + "/" + app
+    _mount_data(app)
     for name in m["files"]:                     # forget any old copies of its modules
         sys.modules.pop(name.rsplit(".", 1)[0], None)
     before = set(sys.modules)
     sys.path.insert(0, d)
+    builtins.open = xpolicy.open                # swap in the policy versions
+    builtins.__import__ = xpolicy.import_hook
+    xpolicy.activate(_policy(app, m))
     try:
         mod = __import__(m["entry"].rsplit(".", 1)[0])
         return mod.main() if hasattr(mod, "main") else None
     finally:
+        xpolicy.deactivate()                    # system code again
+        builtins.open = _real_open
+        builtins.__import__ = _real_import
         sys.path.pop(0)
-        for name in set(sys.modules) - before:  # unload the app's modules again
+        for name in set(sys.modules) - before:  # unload the app's modules
             del sys.modules[name]
+        _umount_data()

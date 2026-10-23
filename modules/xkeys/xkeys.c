@@ -3,8 +3,9 @@
 #include "mbedtls/sha256.h"
 #include "xcrypto.h"
 #include "xkeys.h"
+#include "xpolicy.h"
 
-#define XKEYS_VERSION "0.3.0"
+#define XKEYS_VERSION "0.4.0"
 #define XK_AES256    1
 #define XK_ECC_P256  2
 #define XK_LABEL_MAX 15                 // NVS name limit
@@ -193,6 +194,9 @@ static const char *get_label(mp_obj_t o) {
     const char *s = mp_obj_str_get_data(o, &n);
     if (n == 0 || n > XK_LABEL_MAX) {
         mp_raise_ValueError(MP_ERROR_TEXT("label must be 1..15 characters"));
+    }
+    if (!xp_key_allowed(s)) {                                   // NEW
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("policy: key '%s' not allowed"), s);
     }
     return s;
 }

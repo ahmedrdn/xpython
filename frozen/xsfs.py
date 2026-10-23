@@ -7,7 +7,9 @@ import errno
 import xkeys
 import xcrypto
 
-VERSION = "0.1.0"
+_open = open            # the real open, saved before any app policy is active
+
+VERSION = "0.1.1"
 MAGIC = b"XSF1"
 HEADER = 4 + 12 + 16            # magic + IV + tag
 MAX_FILE = 16 * 1024            # whole file is held in RAM while open
@@ -102,7 +104,7 @@ class SecureFS:
 
     # ---------- Sealing ----------
     def _load(self, path):
-        with open(self._real(path), "rb") as f:
+        with _open(self._real(path), "rb") as f:
             blob = f.read()
         if len(blob) < HEADER or blob[:4] != MAGIC:
             raise OSError(errno.EIO)            # not a sealed file
@@ -119,7 +121,7 @@ class SecureFS:
         ct, tag = xkeys.encrypt(self._key, iv, data, self._aad(path))
         real = self._real(path)
         tmp = real + ".tmp"
-        with open(tmp, "wb") as f:
+        with _open(tmp, "wb") as f:
             f.write(MAGIC + iv + tag + ct)
         os.rename(tmp, real)                    # replace the old version in one step
 
