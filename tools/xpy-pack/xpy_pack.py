@@ -50,7 +50,7 @@ def cmd_build(args):
         else:                                   # compile to .mpy bytecode: no source on the device
             with tempfile.TemporaryDirectory() as tmp:
                 dst = Path(tmp) / (src.stem + ".mpy")
-                subprocess.run([str(MPY_CROSS), "-o", str(dst), str(src)], check=True)
+                subprocess.run([str(MPY_CROSS), "-s", "-o", str(dst), str(src)], check=True)
                 files[dst.name] = dst.read_bytes()
     entry = meta["entry"]
     if not args.no_compile and entry.endswith(".py"):
