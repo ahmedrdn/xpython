@@ -4,7 +4,7 @@
 #include "extmod/vfs.h"
 #include "xpolicy.h"
 
-#define XPOLICY_VERSION "0.1.1"
+#define XPOLICY_VERSION "0.1.2"
 
 // The running app's policy (a dict), or NULL when system code is running.
 // Registered as a root pointer so the garbage collector keeps it alive.
@@ -13,7 +13,8 @@ MP_REGISTER_ROOT_POINTER(mp_obj_t xpolicy_active);
 // Modules an app can never import, even if its manifest asks
 static const char *const FORBIDDEN[] = {
     "sys", "builtins", "micropython", "uctypes", "io", "vfs", "esp", "esp32",
-    "_thread", "ffi", "xinit", "xloader", "xpolicy", "xsfs", "xwatch", "xexec", NULL
+    "_thread", "ffi", "xinit", "xloader", "xpolicy", "xsfs", "xwatch", "xexec",
+    "xnet", "network", "socket", "ssl", "tls", "ntptime", NULL
 };
 // Safe C modules every app may import
 static const char *const DEFAULTS[] = {

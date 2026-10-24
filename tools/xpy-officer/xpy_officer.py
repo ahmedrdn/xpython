@@ -246,13 +246,76 @@ def cmd_unlock(args):
     sys.exit("No unlock window seen. Is autostart on and the device OPERATIONAL?")
 
 
+def cmd_netconfig(args):
+    from cryptography import x509
+    pin = getpass.getpass("SO PIN: ")
+    ssid = input("Wi-Fi name (SSID): ")
+    password = getpass.getpass("Wi-Fi password: ")
+    broker = input("Broker IP address: ")
+    ca = x509.load_pem_x509_certificate((ROOT / "server" / "ca.crt").read_bytes())
+    ca_der = ca.public_bytes(serialization.Encoding.DER).hex()
+    run(args.port, "import xnet\n"
+        f"xnet.configure({pin!r}, {ssid!r}, {password!r}, {broker!r}, 8883, bytes.fromhex({ca_der!r}))\n"
+        'print("XPY:1")')
+    print("Network settings saved on the device (sealed).")
+
+
+def cmd_nettest(args):
+    r = run(args.port, "import xnet\n"
+        'ip, topic = xnet.test("hello from xPython over TLS")\n'
+        'print("XPY:" + json.dumps([ip, topic]))')
+    print(f"Device IP {r[0]}: published to {r[1]}")
+
+
+def cmd_netcert(args):
+    """Give the device a TLS certificate from the network CA (for mutual TLS)."""
+    import datetime as dt
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    st = device_status(args.port)
+    if not st["id"]:
+        sys.exit("Provision the device first.")
+    pin = getpass.getpass("SO PIN: ")
+    name = "xpy-" + st["id"][:12]                       # also its MQTT name and topic prefix
+
+    # 1. The device makes its TLS key pair and sends only the public key
+    pub_hex = run(args.port, "import xnet\n"
+                  f'print("XPY:" + json.dumps(xnet.tls_keygen({pin!r}).hex()))')
+    pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes.fromhex(pub_hex))
+
+    # 2. The network CA signs a client certificate for that public key
+    ca_key = serialization.load_pem_private_key((KEYS / "net_ca.key").read_bytes(), password=None)
+    ca_cert = x509.load_pem_x509_certificate((ROOT / "server" / "ca.crt").read_bytes())
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+            .issuer_name(ca_cert.subject)
+            .public_key(pub)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(days=1))
+            .not_valid_after(now + dt.timedelta(days=730))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+            .sign(ca_key, hashes.SHA256()))
+
+    # 3. Install it on the device; keep a copy in the register
+    der = cert.public_bytes(serialization.Encoding.DER)
+    run(args.port, "import xnet\n"
+        f"xnet.set_tls_cert({pin!r}, bytes.fromhex({der.hex()!r}))\n"
+        'print("XPY:1")')
+    DEVICES.mkdir(exist_ok=True)
+    (DEVICES / f"{st['id']}-tls.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    print(f"TLS certificate issued: CN={name}, valid 2 years (devices/{st['id']}-tls.crt)")
+    
+
 def main():
     parser = argparse.ArgumentParser(description="xPython security officer tool")
     parser.add_argument("--port", default="/dev/ttyUSB0", help="device serial port")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, fn in [("keygen", cmd_keygen), ("status", cmd_status),
-                     ("provision", cmd_provision), ("reset", cmd_reset),
-                     ("unlock", cmd_unlock)]:
+                    ("provision", cmd_provision), ("reset", cmd_reset),
+                    ("unlock", cmd_unlock), ("netconfig", cmd_netconfig),
+                    ("nettest", cmd_nettest), ("netcert", cmd_netcert)]:
         sub.add_parser(name).set_defaults(fn=fn)
     for name, fn in [("devmode", cmd_devmode), ("autostart", cmd_autostart)]:
         p = sub.add_parser(name)

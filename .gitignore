@@ -1,3 +1,4 @@
 micropython/
 esp-idf/
 keys/
+server/*.key

@@ -5,7 +5,7 @@
 #include "xcrypto.h"
 #include "xkeys.h"
 
-#define XINIT_VERSION "0.3.0"
+#define XINIT_VERSION "0.4.0"
 
 // Life-cycle states
 #define ST_BLANK        0
@@ -468,6 +468,13 @@ static mp_obj_t xinit_set_dev_mode(mp_obj_t pin_in, mp_obj_t on_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(xinit_set_dev_mode_obj, xinit_set_dev_mode);
 
+// verify_pin(pin): raises if wrong (uses a try, like every PIN check)
+static mp_obj_t xinit_verify_pin(mp_obj_t pin_in) {
+    check_pin(pin_in);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(xinit_verify_pin_obj, xinit_verify_pin);
+
 // ========== Module table ==========
 static const mp_rom_map_elem_t xinit_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),        MP_ROM_QSTR(MP_QSTR_xinit) },
@@ -487,6 +494,7 @@ static const mp_rom_map_elem_t xinit_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_device_id),       MP_ROM_PTR(&xinit_device_id_obj) },
     { MP_ROM_QSTR(MP_QSTR_dev_mode),        MP_ROM_PTR(&xinit_dev_mode_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_dev_mode),    MP_ROM_PTR(&xinit_set_dev_mode_obj) },
+    { MP_ROM_QSTR(MP_QSTR_verify_pin),      MP_ROM_PTR(&xinit_verify_pin_obj) },
 };
 static MP_DEFINE_CONST_DICT(xinit_globals, xinit_globals_table);
 
