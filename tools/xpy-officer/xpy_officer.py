@@ -87,7 +87,7 @@ def device_status(port):
         '    k = xinit.anchor(n)\n'
         '    a[n] = k.hex() if k else None\n'
         'print("XPY:" + json.dumps({"state": xinit.state(), "pin": xinit.has_pin(),\n'
-        '    "tries": xinit.tries_left(), "id": d.hex() if d else None,\n'
+        '    "tries": xinit.tries_left(), "dev": xinit.dev_mode(), "id": d.hex() if d else None,\n'
         '    "anchors": a, "cert": [x.hex() for x in c] if c else None}))')
 
 
@@ -123,6 +123,7 @@ def cmd_status(args):
     st = device_status(args.port)
     print(f"state : {st['state']}")
     print(f"PIN   : {'set' if st['pin'] else 'not set'}, {st['tries']} tries left")
+    print(f"dev   : {'on (REPL open)' if st['dev'] else 'off'}")
     print(f"id    : {st['id'] or '-'}")
     for name, filename in KEY_FILES.items():
         dev = st["anchors"][name]
@@ -198,14 +199,65 @@ def cmd_reset(args):
     run(args.port, f'xinit.reset({pin!r})\nprint("XPY:1")')
     print("The device is BLANK again.")
 
+BOOT_PY = "import xexec\nxexec.start()\n"
+
+
+def cmd_devmode(args):
+    pin = getpass.getpass("SO PIN: ")
+    on = args.value == "on"
+    run(args.port, f'xinit.set_dev_mode({pin!r}, {on})\nprint("XPY:1")')
+    print("Development mode ON: the REPL stays open." if on else
+          "Development mode OFF: with autostart on, the REPL locks at the next boot.")
+
+
+def cmd_autostart(args):
+    text = BOOT_PY if args.value == "on" else "# xPython autostart off\n"
+    run(args.port, f'with open("/boot.py", "w") as f:\n    f.write({text!r})\nprint("XPY:1")')
+    print(f"Autostart {args.value}: takes effect at the next boot.")
+
+
+def cmd_unlock(args):
+    """Reset the device and send the unlock line during its 3-second window."""
+    import time
+    import serial
+    pin = getpass.getpass("SO PIN: ")
+    print("Resetting the device (if nothing happens, press its RESET/EN button)...")
+    with serial.Serial(args.port, 115200, timeout=0.1) as s:
+        s.dtr = False            # GPIO0 high: normal boot, not download mode
+        s.rts = True             # EN low: hold the chip in reset
+        time.sleep(0.2)
+        s.rts = False            # release: the chip boots
+        out, sent = b"", False
+        end = time.time() + 15
+        while time.time() < end:
+            out += s.read(256)
+            if not sent and b"XPY: unlock window open" in out:
+                s.write(("XPY-UNLOCK " + pin + "\r\n").encode())   # sent ONCE
+                sent = True
+            if b"XPY: unlocked" in out:
+                print("Unlocked: development mode is on, the REPL is available.")
+                return
+            if b"unlock failed" in out:
+                line = [l for l in out.decode(errors="replace").splitlines() if "unlock failed" in l]
+                sys.exit("Unlock refused: " + line[-1])
+            if b"development mode, REPL available" in out:
+                print("The device is not locked.")
+                return
+    sys.exit("No unlock window seen. Is autostart on and the device OPERATIONAL?")
+
 
 def main():
     parser = argparse.ArgumentParser(description="xPython security officer tool")
     parser.add_argument("--port", default="/dev/ttyUSB0", help="device serial port")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, fn in [("keygen", cmd_keygen), ("status", cmd_status),
-                     ("provision", cmd_provision), ("reset", cmd_reset)]:
+                     ("provision", cmd_provision), ("reset", cmd_reset),
+                     ("unlock", cmd_unlock)]:
         sub.add_parser(name).set_defaults(fn=fn)
+    for name, fn in [("devmode", cmd_devmode), ("autostart", cmd_autostart)]:
+        p = sub.add_parser(name)
+        p.add_argument("value", choices=["on", "off"])
+        p.set_defaults(fn=fn)
     args = parser.parse_args()
     try:
         args.fn(args)

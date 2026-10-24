@@ -10,7 +10,7 @@ import xinit
 import xloader
 import xwatch
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 PERIOD_S = 10                         # pause between rounds of apps
 WDT_MS = 2 * xloader.MAX_TIME_MS + 10000
 LOG_MAX = 4096                        # start a new log after this many bytes
@@ -75,6 +75,7 @@ def run_app(app):
 
 def _unlock_window():
     """For a few seconds after boot, accept one line: XPY-UNLOCK <pin>."""
+    print("XPY: unlock window open")
     import select
     poll = select.poll()
     poll.register(sys.stdin, select.POLLIN)
