@@ -86,8 +86,15 @@ def cmd_install(args):
 
 
 def cmd_run(args):
-    mpremote(args.port, "exec", f"import xloader\nprint('Result:', xloader.run({args.app_id!r}))")
-
+    mpremote(args.port, "exec", "import time, xnet, xexec\n"
+             "t0 = time.ticks_ms()\n"
+             "try:\n"
+             "    xnet.connect()\n"
+             "    print('Network ready in', time.ticks_diff(time.ticks_ms(), t0), 'ms')\n"
+             "except Exception as e:\n"
+             "    print('Network not ready:', repr(e))\n"
+             f"r = xexec.run_app({args.app_id!r})\n"
+             "print('Status:', r['status'], '|', r['ms'], 'ms | result:', r['result'])")
 
 def main():
     parser = argparse.ArgumentParser(description="xPython app packer")

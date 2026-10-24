@@ -13,7 +13,7 @@ import xpolicy
 import xsfs
 import xwatch
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAGIC = b"XPK1"
 SIG_LABEL = b"xpy-app-v1"
 MAX_PACKAGE = 64 * 1024
@@ -89,6 +89,10 @@ def _check_permissions(p):
         t = p["time_ms"]
         if not isinstance(t, int) or not 1 <= t <= MAX_TIME_MS:
             raise ValueError("time_ms must be 1.." + str(MAX_TIME_MS))
+    for t in p.get("publish", []):
+        if (not isinstance(t, str) or not 0 < len(t) <= 64 or t.startswith("/")
+                or "+" in t or ".." in t or ("#" in t and not (t == "#" or t.endswith("/#")))):
+            raise ValueError("bad publish topic in permissions: " + str(t))
 
 
 def _data_key(app):
@@ -164,12 +168,15 @@ def _policy(app, m):
     modules = [n.rsplit(".", 1)[0] for n in m["files"]] + [x for x in p.get("modules", [])]
     if p.get("keys"):
         modules.append("xkeys")
+    if p.get("publish"):
+        modules.append("xmsg")
     return {
         "app": app,
         "modules": modules,
         "read": [x for x in fs.get("read", [])],
         "write": [x for x in fs.get("write", [])] + ["/data"],   # its private folder
         "keys": [x for x in p.get("keys", [])] + [_data_key(app)],
+        "publish": [x for x in p.get("publish", [])],
     }
 
 

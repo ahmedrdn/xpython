@@ -1,3 +1,9 @@
+import xpolicy
+try:
+    import network
+    import ntptime
+except ImportError:                   # the PC build has no Wi-Fi
+    network = ntptime = None
 # xnet: xPython Network & Communication (frozen into the firmware).
 # System code only: apps never import it (xpolicy forbids it).
 # Stores network settings sealed, joins Wi-Fi, and talks MQTT over TLS,
@@ -12,7 +18,7 @@ import xcrypto
 import xinit
 import xsfs
 
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 BROKER_NAME = "xpython-broker"       # the name inside the broker's certificate
 _STORE = "/xsys"                      # sealed system storage (an xsfs mount)
 _STORE_ROOT = "/.xsys"
@@ -106,7 +112,6 @@ def has_tls_cert():
 # ---------- Wi-Fi and time ----------
 def connect_wifi(timeout_s=20):
     """Join the configured Wi-Fi. Returns the device's IP address."""
-    import network
     cfg = _load()
     w = network.WLAN(network.STA_IF)
     w.active(True)
@@ -121,13 +126,26 @@ def connect_wifi(timeout_s=20):
 
 
 def sync_time():
-    """Set the clock from the internet, if reachable (certificates have dates)."""
     try:
-        import ntptime
         ntptime.settime()
         return True
     except Exception:
         return False
+
+def tls_connect(port):
+    """A TLS connection to the server: checks its certificate, shows ours (mutual TLS)."""
+    cfg = _load()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cadata=bytes.fromhex(cfg["ca"]))
+    cert = _seal_read("tls.crt")
+    if cert is not None:
+        ctx.load_cert_chain(cert, _seal_read("tls.key"))
+    addr = socket.getaddrinfo(cfg["broker"], port)[0][-1]
+    sock = socket.socket()
+    sock.settimeout(10)
+    sock.connect(addr)
+    return ctx.wrap_socket(sock, server_hostname=BROKER_NAME)
 
 
 # ---------- A minimal MQTT 3.1.1 client over TLS ----------
@@ -136,17 +154,7 @@ class MQTT:
 
     def __init__(self, client_id, keepalive=60):
         cfg = _load()
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.verify_mode = ssl.CERT_REQUIRED                    # the broker MUST prove itself
-        ctx.load_verify_locations(cadata=bytes.fromhex(cfg["ca"]))
-        cert = _seal_read("tls.crt")
-        if cert is not None:                                   # prove who WE are (mutual TLS)
-            ctx.load_cert_chain(cert, _seal_read("tls.key"))
-        addr = socket.getaddrinfo(cfg["broker"], cfg["port"])[0][-1]
-        sock = socket.socket()
-        sock.settimeout(10)
-        sock.connect(addr)
-        self._s = ctx.wrap_socket(sock, server_hostname=BROKER_NAME)
+        self._s = tls_connect(cfg["port"])
 
         # CONNECT: protocol "MQTT", level 4 (3.1.1), clean session, keepalive, client id
         cid = client_id.encode()
@@ -196,3 +204,52 @@ def test(message="hello"):
     c.publish(topic, message)
     c.close()
     return ip, topic
+
+# ---------- The network service for apps (xmsg.publish) ----------
+_client = None                        # one TLS connection, shared and reused
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        connect_wifi()
+        # Certificates have validity dates, so the clock must be right before TLS
+        if not sync_time() and time.localtime()[0] < 2025:
+            raise OSError("clock not set: internet time (NTP) not reachable")
+        _client = MQTT(client_id())
+    return _client
+
+
+def publish(topic, payload):
+    """System publish, reconnecting once if the connection dropped."""
+    global _client
+    for attempt in range(2):
+        try:
+            _get_client().publish(topic, payload)
+            return
+        except OSError:
+            try:
+                if _client is not None:
+                    _client.close()
+            except OSError:
+                pass
+            _client = None
+            if attempt:
+                raise
+
+
+def connect():
+    """Open the shared connection now (e.g. at boot), so apps publish quickly."""
+    _get_client()
+
+
+def app_publish(app, sub, payload):
+    """Called by xmsg.publish (in C) after the policy check."""
+    if not isinstance(payload, (str, bytes)):
+        raise TypeError("payload must be str or bytes")
+    topic = "xpy/" + client_id() + "/" + app + "/" + sub
+    publish(topic, payload)
+    return topic
+
+
+xpolicy.set_publisher(app_publish)    # register the service at import

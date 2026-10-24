@@ -9,6 +9,8 @@ import json
 import xinit
 import xloader
 import xwatch
+import xnet
+import xota
 
 VERSION = "0.1.1"
 PERIOD_S = 10                         # pause between rounds of apps
@@ -101,6 +103,10 @@ def _unlock_window():
 
 
 def start():
+    try:
+        print("xPython:", xota.confirm())     # keep a new firmware only if its self-test passes
+    except Exception as e:
+        _log({"app": "-", "status": "ota confirm: " + repr(e)})
     """Called from boot.py. Returns at once in development mode (REPL open).
     Otherwise runs all installed apps forever and never returns (REPL locked)."""
     if xinit.state() != "OPERATIONAL" or xinit.dev_mode():
@@ -113,6 +119,10 @@ def start():
         micropython.kbd_intr(3)
         return
     print("xPython: OPERATIONAL, REPL locked")
+    try:
+        xnet.connect()                # open the network early; apps publish quickly
+    except Exception as e:
+        _log({"app": "-", "status": "network: " + repr(e)})
     wdt = machine.WDT(timeout=WDT_MS) # last resort: reset if anything hangs
     while True:
         try:

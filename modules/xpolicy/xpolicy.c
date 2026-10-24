@@ -4,17 +4,19 @@
 #include "extmod/vfs.h"
 #include "xpolicy.h"
 
-#define XPOLICY_VERSION "0.1.2"
+#define XPOLICY_VERSION "0.2.2"
 
 // The running app's policy (a dict), or NULL when system code is running.
 // Registered as a root pointer so the garbage collector keeps it alive.
 MP_REGISTER_ROOT_POINTER(mp_obj_t xpolicy_active);
+// The system's network service for apps (registered by xnet), or NULL
+MP_REGISTER_ROOT_POINTER(mp_obj_t xpolicy_publisher);
 
 // Modules an app can never import, even if its manifest asks
 static const char *const FORBIDDEN[] = {
     "sys", "builtins", "micropython", "uctypes", "io", "vfs", "esp", "esp32",
     "_thread", "ffi", "xinit", "xloader", "xpolicy", "xsfs", "xwatch", "xexec",
-    "xnet", "network", "socket", "ssl", "tls", "ntptime", NULL
+    "xnet", "network", "socket", "ssl", "tls", "ntptime", "xota", NULL
 };
 // Safe C modules every app may import
 static const char *const DEFAULTS[] = {
@@ -104,6 +106,30 @@ static bool module_allowed(const char *name) {
 // C interface for xkeys
 int xp_key_allowed(const char *label) {
     return !active() || in_list(field(MP_QSTR_keys), label);
+}
+
+// Is subtopic `sub` allowed by the app's "publish" list?
+// "telemetry" allows exactly that; "alerts/#" allows "alerts" and anything under it; "#" allows all.
+static bool topic_allowed(const char *sub, mp_obj_t patterns) {
+    size_t n;
+    mp_obj_t *items;
+    mp_obj_get_array(patterns, &n, &items);
+    for (size_t i = 0; i < n; i++) {
+        size_t pl;
+        const char *p = mp_obj_str_get_data(items[i], &pl);
+        if (pl == 1 && p[0] == '#') {
+            return true;
+        }
+        if (pl >= 2 && p[pl - 2] == '/' && p[pl - 1] == '#') {
+            size_t base = pl - 2;
+            if (strncmp(sub, p, base) == 0 && (sub[base] == '\0' || sub[base] == '/')) {
+                return true;
+            }
+        } else if (strcmp(sub, p) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ========== The restricted "os" that apps get ==========
@@ -216,6 +242,13 @@ static mp_obj_t xpolicy_import_hook(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(xpolicy_import_hook_obj, 1, 5, xpolicy_import_hook);
 
+// set_publisher(func): the system registers its network service, func(app, subtopic, payload)
+static mp_obj_t xpolicy_set_publisher(mp_obj_t func) {
+    MP_STATE_VM(xpolicy_publisher) = func;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(xpolicy_set_publisher_obj, xpolicy_set_publisher);
+
 // ========== Module table ==========
 static const mp_rom_map_elem_t xpolicy_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),    MP_ROM_QSTR(MP_QSTR_xpolicy) },
@@ -225,6 +258,7 @@ static const mp_rom_map_elem_t xpolicy_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_active),      MP_ROM_PTR(&xpolicy_active_app_obj) },
     { MP_ROM_QSTR(MP_QSTR_open),        MP_ROM_PTR(&xpolicy_open_obj) },
     { MP_ROM_QSTR(MP_QSTR_import_hook), MP_ROM_PTR(&xpolicy_import_hook_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_publisher), MP_ROM_PTR(&xpolicy_set_publisher_obj) },
 };
 static MP_DEFINE_CONST_DICT(xpolicy_globals, xpolicy_globals_table);
 
@@ -233,3 +267,38 @@ const mp_obj_module_t xpolicy_module = {
     .globals = (mp_obj_dict_t *)&xpolicy_globals,
 };
 MP_REGISTER_MODULE(MP_QSTR_xpolicy, xpolicy_module);
+
+// ========== xmsg: the publish service apps use ==========
+// publish(subtopic, payload) -> the full topic it was published to
+static mp_obj_t xmsg_publish(mp_obj_t sub_in, mp_obj_t payload_in) {
+    if (!active()) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("xmsg: only for running apps"));
+    }
+    size_t n;
+    const char *sub = mp_obj_str_get_data(sub_in, &n);
+    if (n == 0 || n > 64 || sub[0] == '/' || strpbrk(sub, "+#") != NULL || strstr(sub, "..") != NULL) {
+        mp_raise_ValueError(MP_ERROR_TEXT("xmsg: bad subtopic"));
+    }
+    if (!topic_allowed(sub, field(MP_QSTR_publish))) {
+        mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("policy: publish to '%s' denied"), sub);
+    }
+    mp_obj_t handler = MP_STATE_VM(xpolicy_publisher);
+    if (handler == MP_OBJ_NULL || handler == mp_const_none) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("xmsg: no network service"));
+    }
+    mp_obj_t args[3] = { field(MP_QSTR_app), sub_in, payload_in };
+    return mp_call_function_n_kw(handler, 3, 0, args);
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(xmsg_publish_obj, xmsg_publish);
+
+static const mp_rom_map_elem_t xmsg_globals_table[] = {
+    { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_xmsg) },
+    { MP_ROM_QSTR(MP_QSTR_publish),  MP_ROM_PTR(&xmsg_publish_obj) },
+};
+static MP_DEFINE_CONST_DICT(xmsg_globals, xmsg_globals_table);
+
+const mp_obj_module_t xmsg_module = {
+    .base = { &mp_type_module },
+    .globals = (mp_obj_dict_t *)&xmsg_globals,
+};
+MP_REGISTER_MODULE(MP_QSTR_xmsg, xmsg_module);

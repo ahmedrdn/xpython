@@ -21,6 +21,13 @@
       "type": "shell",
       "command": "for t in tests/test_*.py; do mpremote connect /dev/ttyUSB0 run $t || exit 1; done",      "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
+    },
+    {
+      "label": "ESP32: build",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
+      "problemMatcher": ["$gcc"]
     }
   ]
 }

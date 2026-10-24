@@ -1,0 +1,6 @@
+{
+  "app_id": "sensor",
+  "version": "1.0.0",
+  "entry": "main.py",
+  "permissions": {"publish": ["telemetry"], "time_ms": 15000}
+}
