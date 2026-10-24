@@ -11,12 +11,15 @@ import xinit
 import xkeys
 import xpolicy
 import xsfs
+import xwatch
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAGIC = b"XPK1"
 SIG_LABEL = b"xpy-app-v1"
 MAX_PACKAGE = 64 * 1024
 RESERVED = ("manifest.json", "manifest.sig")
+DEFAULT_TIME_MS = 5000            # time limit when the manifest gives none
+MAX_TIME_MS = 30000
 _root = "/apps"
 _real_open = open                 # saved before any app policy is active
 _real_import = __import__
@@ -82,6 +85,10 @@ def _check_permissions(p):
         for item in p.get(kind, []):
             if not isinstance(item, str):
                 raise ValueError("bad " + kind + " in permissions")
+    if "time_ms" in p:
+        t = p["time_ms"]
+        if not isinstance(t, int) or not 1 <= t <= MAX_TIME_MS:
+            raise ValueError("time_ms must be 1.." + str(MAX_TIME_MS))
 
 
 def _data_key(app):
@@ -268,28 +275,50 @@ def verify(app):
     return m
 
 
+_running = None          # (app folder, modules loaded before) while an app runs
+
+
+def _cleanup():
+    """Undo everything run() set up. Safe to call more than once."""
+    global _running
+    xwatch.disarm()                             # first: no more timeout interrupts
+    xpolicy.deactivate()
+    builtins.open = _real_open
+    builtins.__import__ = _real_import
+    if _running is not None:
+        d, before = _running
+        _running = None
+        if sys.path and sys.path[0] == d:
+            sys.path.pop(0)
+        for name in set(sys.modules) - before:
+            del sys.modules[name]
+    _umount_data()
+
+
+def cleanup():
+    """Make sure no app policy, time limit or /data mount is left active."""
+    _cleanup()
+
+
 def run(app):
-    """Verify the app, then run its main() under its own policy."""
-    if xpolicy.active() is not None:                                  # NEW
+    """Verify the app, then run its main() under its own policy and time limit."""
+    global _running
+    if xpolicy.active() is not None:
         raise ValueError("another app is running: " + xpolicy.active())
     m = verify(app)
+    limit = m["permissions"].get("time_ms", DEFAULT_TIME_MS)
     d = _root + "/" + app
     _mount_data(app)
     for name in m["files"]:                     # forget any old copies of its modules
         sys.modules.pop(name.rsplit(".", 1)[0], None)
-    before = set(sys.modules)
+    _running = (d, set(sys.modules))
     sys.path.insert(0, d)
     builtins.open = xpolicy.open                # swap in the policy versions
     builtins.__import__ = xpolicy.import_hook
     xpolicy.activate(_policy(app, m))
     try:
+        xwatch.arm(limit)                       # start the clock
         mod = __import__(m["entry"].rsplit(".", 1)[0])
         return mod.main() if hasattr(mod, "main") else None
     finally:
-        xpolicy.deactivate()                    # system code again
-        builtins.open = _real_open
-        builtins.__import__ = _real_import
-        sys.path.pop(0)
-        for name in set(sys.modules) - before:  # unload the app's modules
-            del sys.modules[name]
-        _umount_data()
+        _cleanup()

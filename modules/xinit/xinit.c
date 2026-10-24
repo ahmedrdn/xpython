@@ -5,7 +5,7 @@
 #include "xcrypto.h"
 #include "xkeys.h"
 
-#define XINIT_VERSION "0.2.0"
+#define XINIT_VERSION "0.3.0"
 
 // Life-cycle states
 #define ST_BLANK        0
@@ -27,6 +27,7 @@ static const char *const state_names[] = { "BLANK", "PERSONALIZED", "OPERATIONAL
 #define R_ID    "id"
 #define R_CERT  "cert"                  // 64-byte vendor signature
 #define R_MAX   72                      // biggest record (an anchor: 65 bytes)
+#define R_DEV   "dev"                   // 1 = development mode (REPL stays open)
 
 // Trust anchors: Python name -> record name
 static const char *const anchor_names[]   = { "vendor",   "app",   "fw"   };
@@ -448,6 +449,25 @@ static mp_obj_t xinit_device_id(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(xinit_device_id_obj, xinit_device_id);
 
+// dev_mode() -> True if the REPL stays open even when OPERATIONAL
+static mp_obj_t xinit_dev_mode(void) {
+    uint8_t d;
+    size_t n = 1;
+    return mp_obj_new_bool(store_get(R_DEV, &d, &n) == 0 && d == 1);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(xinit_dev_mode_obj, xinit_dev_mode);
+
+// set_dev_mode(pin, on)
+static mp_obj_t xinit_set_dev_mode(mp_obj_t pin_in, mp_obj_t on_in) {
+    uint8_t b = mp_obj_is_true(on_in) ? 1 : 0;
+    check_pin(pin_in);
+    if (store_put(R_DEV, &b, 1) != 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("storage error"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(xinit_set_dev_mode_obj, xinit_set_dev_mode);
+
 // ========== Module table ==========
 static const mp_rom_map_elem_t xinit_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),        MP_ROM_QSTR(MP_QSTR_xinit) },
@@ -465,6 +485,8 @@ static const mp_rom_map_elem_t xinit_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_finalize),        MP_ROM_PTR(&xinit_finalize_obj) },
     { MP_ROM_QSTR(MP_QSTR_reset),           MP_ROM_PTR(&xinit_reset_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_id),       MP_ROM_PTR(&xinit_device_id_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dev_mode),        MP_ROM_PTR(&xinit_dev_mode_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_dev_mode),    MP_ROM_PTR(&xinit_set_dev_mode_obj) },
 };
 static MP_DEFINE_CONST_DICT(xinit_globals, xinit_globals_table);
 
