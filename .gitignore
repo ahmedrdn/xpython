@@ -1,6 +1,6 @@
 micropython/
 esp-idf/
 keys/
-server/*.key
+server/
 build/
 *.xpk
