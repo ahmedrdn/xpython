@@ -1,7 +1,5 @@
 include("$(PORT_DIR)/boards/manifest.py")
-module("xsfs.py", base_path="$(BOARD_DIR)/../../frozen")
-module("xloader.py", base_path="$(BOARD_DIR)/../../frozen")
-module("xexec.py", base_path="$(BOARD_DIR)/../../frozen")
-module("xnet.py", base_path="$(BOARD_DIR)/../../frozen")
-module("xfw.py", base_path="$(BOARD_DIR)/../../frozen")
-module("xota.py", base_path="$(BOARD_DIR)/../../frozen")
+
+# xPython modules written in Python: frozen into the firmware
+for name in ("xfw", "xsfs", "xloader", "xexec", "xnet", "xota"):
+    module(name + ".py", base_path="$(BOARD_DIR)/../../modules/" + name)

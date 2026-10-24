@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = ROOT / "micropython/ports/esp32/build-XPY_ESP32/micropython.bin"
-XFW = ROOT / "frozen/xfw.py"
+XFW = ROOT / "modules/xfw/xfw.py"
 OTA_DIR = ROOT / "build/ota"
 FW_KEY = ROOT / "keys/fw_sign.pem"
 SERVER = ROOT / "server"

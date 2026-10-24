@@ -4,8 +4,11 @@
 import json
 import struct
 import hashlib
-import esp32
-import machine
+try:
+    import esp32
+    import machine
+except ImportError:          # the PC build has no OTA hardware
+    esp32 = machine = None
 import xcrypto
 import xinit
 import xnet
