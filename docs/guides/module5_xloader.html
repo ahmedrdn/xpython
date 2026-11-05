@@ -1,0 +1,251 @@
+<h1>Module 5 · xloader: the secure app loader</h1>
+<p class="sub">xPython framework guide, concept edition · goal → functions → data flow → connections → testing · 31 October 2026</p>
+
+<div class="note"><b>In one line:</b> <code>xloader</code> installs and runs an app <b>only if the app developer signed it</b> and <b>no file has changed since</b>, and it runs the app <b>only inside the sandbox</b> written in its signed manifest.</div>
+
+<h2>1. Goal</h2>
+<p>On a normal MicroPython board, anyone can copy a <code>.py</code> file to the flash and run it, and that code can do anything: read every file, use every key, talk to the network. <code>xloader</code> is the <b>gatekeeper for application code</b>. It makes three promises:</p>
+<ul>
+<li><b>Only trusted code is installed:</b> the package must carry a valid signature from the device's <b>app</b> trust anchor (set by <code>xinit</code>).</li>
+<li><b>Only unmodified code runs:</b> the SHA-256 of every file is in the signed manifest, and it is <b>checked again before every run</b>.</li>
+<li><b>Code runs only inside its sandbox:</b> the manifest's permissions become a policy that <code>xpolicy</code> enforces, plus a time limit that <code>xwatch</code> enforces.</li>
+</ul>
+<p><b>Analogy:</b> a sealed medicine box from a pharmacy. The <b>label</b> (manifest) lists every pill and its exact weight, and the label carries the <b>manufacturer's stamp</b> (signature). The pharmacist checks the stamp, weighs every pill against the label, and refuses the box if anything differs. And even a good medicine comes with a <b>dose limit</b> (permissions and time limit).</p>
+<p><code>xloader</code> is Python, <b>frozen into the firmware</b>: it is compiled into the firmware image, not stored as a file, so nobody can replace it on the filesystem. Only a new signed firmware (<code>xota</code>) can change it.</p>
+
+<h2>2. The app package (.xpk)</h2>
+<p>An app is shipped as one binary file. All numbers are little-endian.</p>
+<pre>[ "XPK1" 4 B | manifest length 4 B | manifest (JSON) | signature 64 B | file entries ... ]
+  file entry = [ name length 2 B | name | data length 4 B | data ]</pre>
+<table>
+<tr><th>Part</th><th>Meaning</th></tr>
+<tr><td><code>XPK1</code></td><td>"This is an xPython package, format 1"</td></tr>
+<tr><td>manifest</td><td>JSON describing the app, including the <b>SHA-256 of every file</b>. This is the only signed part</td></tr>
+<tr><td>signature</td><td>ECDSA P-256, raw <code>r||s</code> (32 + 32 bytes), over <code>b"xpy-app-v1" + manifest</code></td></tr>
+<tr><td>file entries</td><td>The app's files, usually <code>.mpy</code> bytecode (no source code on the device)</td></tr>
+</table>
+
+<h3>The manifest</h3>
+<p>The developer writes <code>app.json</code>; <code>xpy-pack build</code> compiles <code>.py</code> to <code>.mpy</code>, adds the hashes and signs. For <code>apps/sensor</code>:</p>
+<pre>{"app_id": "sensor", "version": "1.0.0", "entry": "main.mpy",
+ "files": {"main.mpy": "9c1f…e3"},                       # SHA-256 of each file
+ "permissions": {"publish": ["telemetry"], "time_ms": 15000}}</pre>
+<table>
+<tr><th>Field</th><th>Rule checked by xloader</th></tr>
+<tr><td><code>app_id</code>, file names</td><td>1–32 characters, no <code>/</code> or <code>\</code>, not starting with <code>.</code>, not <code>manifest.json</code> / <code>manifest.sig</code></td></tr>
+<tr><td><code>version</code></td><td>Exactly <code>x.y.z</code> (integers), and <b>newer</b> than the installed version</td></tr>
+<tr><td><code>entry</code></td><td>Must be one of the files</td></tr>
+<tr><td><code>permissions.fs</code></td><td><code>{"read": [...], "write": [...]}</code>: absolute paths, no <code>..</code></td></tr>
+<tr><td><code>permissions.keys</code></td><td>xkeys labels the app may use</td></tr>
+<tr><td><code>permissions.modules</code></td><td>Extra modules the app may import (forbidden ones stay forbidden)</td></tr>
+<tr><td><code>permissions.publish</code></td><td>MQTT subtopics: no <code>+</code>, no <code>..</code>, <code>#</code> only at the end</td></tr>
+<tr><td><code>permissions.time_ms</code></td><td>1–30000 ms; <b>5000 ms</b> if missing</td></tr>
+</table>
+<div class="note"><b>Key idea: sign the manifest, hash the files.</b> The signature covers only the small manifest, but the manifest holds the hash of every file. Changing one byte of a file changes its hash, which no longer matches the signed manifest. This is a <b>hash list</b> (a one-level Merkle tree).</div>
+
+<h2>3. Main functions</h2>
+<table>
+<tr><th>Function</th><th>What it does</th><th>Returns</th></tr>
+<tr><td><code>install(path)</code></td><td>Reads a <code>.xpk</code>, runs every check, writes the app to <code>/apps/&lt;app_id&gt;/</code></td><td>app_id / <code>ValueError</code></td></tr>
+<tr><td><code>verify(app)</code></td><td>Re-checks an installed app: the stored signature, then every file hash</td><td>manifest dict / <code>ValueError</code></td></tr>
+<tr><td><code>run(app)</code></td><td><code>verify()</code>, then sandbox + time limit, import the entry file, call <code>main()</code>, always clean up</td><td>what <code>main()</code> returns</td></tr>
+<tr><td><code>cleanup()</code></td><td>Turns off sandbox, timer and <code>/data</code>. Safe to call many times</td><td>None</td></tr>
+<tr><td><code>list()</code></td><td>Installed apps (hidden folders <code>.stage</code>, <code>.data</code> are skipped)</td><td>list of names</td></tr>
+<tr><td><code>info(app)</code></td><td>The stored manifest, <b>without</b> checking it</td><td>dict / None</td></tr>
+<tr><td><code>remove(app)</code></td><td>Deletes the app, its private data folder and its private data key</td><td>None</td></tr>
+<tr><td><code>set_root(path)</code></td><td>Changes the install folder (PC tests use <code>/tmp/…</code>)</td><td>None</td></tr>
+</table>
+
+<h2>4. Data flow</h2>
+<h3>Installing: a chain of checks</h3>
+<figure>
+<svg width="100%" viewBox="0 0 680 250" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+  <g font-size="12" text-anchor="middle">
+    <rect x="20"  y="20" width="145" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="92"  y="42" fill="#2C2C2A">sensor.xpk</text><text x="92" y="59" font-size="10" fill="#5F5E5A">OPERATIONAL, ≤ 64 KB</text>
+    <rect x="185" y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="257" y="42" font-weight="bold" fill="#26215C">_parse</text><text x="257" y="59" font-size="10" fill="#3C3489">magic, lengths</text>
+    <rect x="350" y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="422" y="42" font-weight="bold" fill="#26215C">ECDSA verify</text><text x="422" y="59" font-size="10" fill="#3C3489">xinit.anchor("app")</text>
+    <rect x="515" y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="587" y="42" font-weight="bold" fill="#26215C">manifest rules</text><text x="587" y="59" font-size="10" fill="#3C3489">names, permissions</text>
+
+    <rect x="515" y="110" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="587" y="132" font-weight="bold" fill="#26215C">file hashes</text><text x="587" y="149" font-size="10" fill="#3C3489">same names, SHA-256</text>
+    <rect x="350" y="110" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="422" y="132" font-weight="bold" fill="#26215C">newer version?</text><text x="422" y="149" font-size="10" fill="#3C3489">vs installed copy</text>
+    <rect x="185" y="110" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="257" y="132" font-weight="bold" fill="#26215C">write .stage</text><text x="257" y="149" font-size="10" fill="#3C3489">then rename</text>
+    <rect x="20"  y="110" width="145" height="52" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.6"/><text x="92"  y="132" fill="#04342C">installed</text><text x="92" y="149" font-size="10" fill="#085041">/apps/sensor/</text>
+
+    <g stroke="#5F5E5A" stroke-width="1.2" fill="none" marker-end="url(#ar)">
+      <line x1="165" y1="46" x2="181" y2="46"/><line x1="330" y1="46" x2="346" y2="46"/><line x1="495" y1="46" x2="511" y2="46"/>
+      <line x1="587" y1="72" x2="587" y2="106"/>
+      <line x1="515" y1="136" x2="499" y2="136"/><line x1="350" y1="136" x2="334" y2="136"/><line x1="185" y1="136" x2="169" y2="136"/>
+    </g>
+    <rect x="185" y="190" width="475" height="34" rx="6" fill="#FAECE7" stroke="#993C1D" stroke-width="0.6"/><text x="422" y="212" fill="#4A1B0C">any purple step fails → ValueError, /apps is not touched</text>
+  </g>
+</svg>
+<figcaption>Figure 1. install(): nothing is written until every check has passed.</figcaption>
+</figure>
+<table>
+<tr><th>Check</th><th>Stops</th></tr>
+<tr><td>Device is <code>OPERATIONAL</code></td><td>Installing on a blank, unfinished or LOCKED device</td></tr>
+<tr><td>Size ≤ 64 KB</td><td>Running out of RAM (the whole package is read into memory)</td></tr>
+<tr><td>Signature with the app anchor</td><td>Packages not signed by your app developer key</td></tr>
+<tr><td>Signature checked <b>before</b> <code>json.loads</code></td><td>Untrusted JSON reaching the parser</td></tr>
+<tr><td>Manifest rules</td><td>Path escapes like <code>../boot.py</code>, bad permissions</td></tr>
+<tr><td>File hashes</td><td>Files changed, added or removed after signing</td></tr>
+<tr><td>Newer version</td><td>Downgrade to an older (buggy) version, re-install of the same version</td></tr>
+<tr><td>Write to <code>.stage</code>, then rename</td><td>A half-installed app: the folder is the old version or the new one, never a mix</td></tr>
+</table>
+<p>The app folder also keeps <code>manifest.json</code> and <code>manifest.sig</code>, so the app can be checked again later.</p>
+
+<h3>Running: verify, sandbox, run, clean up</h3>
+<figure>
+<svg width="100%" viewBox="0 0 680 250" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+  <g font-size="12" text-anchor="middle">
+    <rect x="20"  y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="92"  y="42" font-weight="bold" fill="#26215C">verify(app)</text><text x="92" y="59" font-size="10" fill="#3C3489">signature + every hash</text>
+    <rect x="185" y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="257" y="42" font-weight="bold" fill="#26215C">mount /data</text><text x="257" y="59" font-size="10" fill="#3C3489">xsfs, key a_&lt;hash&gt;</text>
+    <rect x="350" y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="422" y="42" font-weight="bold" fill="#26215C">swap open, import</text><text x="422" y="59" font-size="10" fill="#3C3489">for xpolicy versions</text>
+    <rect x="515" y="20" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="587" y="42" font-weight="bold" fill="#26215C">xpolicy.activate</text><text x="587" y="59" font-size="10" fill="#3C3489">policy from manifest</text>
+
+    <rect x="515" y="110" width="145" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="587" y="132" font-weight="bold" fill="#26215C">xwatch.arm(ms)</text><text x="587" y="149" font-size="10" fill="#3C3489">start the clock</text>
+    <rect x="350" y="110" width="145" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="422" y="132" fill="#2C2C2A">import entry</text><text x="422" y="149" font-size="10" fill="#5F5E5A">call main()</text>
+    <rect x="185" y="110" width="145" height="52" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.6"/><text x="257" y="132" fill="#04342C">finally: _cleanup</text><text x="257" y="149" font-size="10" fill="#085041">always runs</text>
+    <rect x="20"  y="110" width="145" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="92"  y="132" fill="#2C2C2A">result</text><text x="92" y="149" font-size="10" fill="#5F5E5A">back to xexec</text>
+
+    <g stroke="#5F5E5A" stroke-width="1.2" fill="none" marker-end="url(#ar2)">
+      <line x1="165" y1="46" x2="181" y2="46"/><line x1="330" y1="46" x2="346" y2="46"/><line x1="495" y1="46" x2="511" y2="46"/>
+      <line x1="587" y1="72" x2="587" y2="106"/>
+      <line x1="515" y1="136" x2="499" y2="136"/><line x1="350" y1="136" x2="334" y2="136"/><line x1="185" y1="136" x2="169" y2="136"/>
+    </g>
+    <rect x="20" y="190" width="640" height="34" rx="6" fill="#FAECE7" stroke="#993C1D" stroke-width="0.6"/><text x="340" y="212" fill="#4A1B0C">file changed → ValueError before anything runs · timeout / crash → error, but cleanup still runs</text>
+  </g>
+</svg>
+<figcaption>Figure 2. run(): the app is checked again, boxed in, timed, and always cleaned up.</figcaption>
+</figure>
+<p><b>Cleanup order:</b> <code>xwatch.disarm()</code> → <code>xpolicy.deactivate()</code> → restore <code>open</code> and <code>__import__</code> → forget the app's modules and path → unmount <code>/data</code>. The timer goes <b>first</b>, so a timeout can't interrupt the cleanup halfway. <code>xexec</code> also calls <code>xloader.cleanup()</code> after every app, as a second safety net.</p>
+
+<h3>The policy that run() builds</h3>
+<p>For the sensor manifest, <code>_policy()</code> gives <code>xpolicy</code>:</p>
+<pre>{"app": "sensor",
+ "modules": ["main", "xmsg"],     # own files + "modules" + xkeys/xmsg if needed
+ "read":    [],
+ "write":   ["/data"],             # always its private folder
+ "keys":    ["a_&lt;12 hex&gt;"],        # always its private data key
+ "publish": ["telemetry"]}</pre>
+<table>
+<tr><th>Kind of module</th><th>Examples</th><th>Can the app import it?</th></tr>
+<tr><td>Safe defaults</td><td><code>time, math, json, struct, re, hashlib, xcrypto</code></td><td>Always</td></tr>
+<tr><td><code>os</code></td><td><code>os.listdir, os.remove</code></td><td>Yes, but a <b>restricted os</b>: every path is checked against read / write</td></tr>
+<tr><td>Others</td><td><code>machine</code></td><td>Only if listed in <code>permissions.modules</code></td></tr>
+<tr><td>Forbidden</td><td><code>sys, builtins, xinit, xloader, xpolicy, network, socket</code></td><td>Never, even if the manifest asks</td></tr>
+</table>
+
+<h2>5. Who uses xloader, and what it uses</h2>
+<table>
+<tr><th>Module</th><th>Link</th><th>For</th></tr>
+<tr><td><code>xinit</code> (Module 3)</td><td><code>state()</code>, <code>anchor("app")</code></td><td>Install only when OPERATIONAL; the app anchor decides which developer is trusted</td></tr>
+<tr><td><code>xcrypto</code> (Module 1)</td><td><code>ecdsa_verify()</code>, <code>sha256()</code></td><td>Signature and file hashes</td></tr>
+<tr><td><code>xkeys</code> (Module 2)</td><td><code>exists()</code>, <code>delete()</code></td><td>Each app's private key <code>a_&lt;hash&gt;</code>; deleting it on <code>remove()</code> makes the app's old data unreadable</td></tr>
+<tr><td><code>xsfs</code> (Module 4)</td><td><code>mount("/data", …)</code></td><td>Each app's own sealed folder <code>/apps/.data/&lt;app&gt;</code></td></tr>
+<tr><td><code>xpolicy</code> (next)</td><td><code>open</code>, <code>import_hook</code>, <code>activate()</code></td><td>Enforces the sandbox that xloader describes</td></tr>
+<tr><td><code>xwatch</code> (next)</td><td><code>arm()</code>, <code>disarm()</code></td><td>Stops the app when its time is over</td></tr>
+<tr><td><code>xexec</code> (later)</td><td>calls <code>run()</code>, <code>cleanup()</code>, <code>list()</code></td><td>Runs apps at boot, catches every error, logs the result</td></tr>
+<tr><td><code>xpy-pack</code> (PC tool)</td><td>same <code>.xpk</code> format</td><td>Builds and signs packages with <code>keys/app_sign.pem</code></td></tr>
+</table>
+<p><b>Why the label <code>"xpy-app-v1"</code>?</b> Each signature in xPython starts with its own label (<code>xpy-devcert-v1</code> for the device certificate, <code>xpy-app-v1</code> for apps). A signature made for one purpose can never be reused for another. This is called <b>domain separation</b>.</p>
+
+<h2>6. Test it yourself</h2>
+<div class="warn"><b>Where to test:</b> Steps 1–7 use the <b>PC build</b> (start the PC REPL with the MICROPYPATH command from CLAUDE.md). They need a freshly provisioned device, so <b>don't run them on board A</b>. Step 8 is read-only and safe on board A. For multi-line blocks, use paste mode: <b>Ctrl-E</b>, paste, <b>Ctrl-D</b>.</div>
+
+<h3>Step 1 · Provision the device in RAM (you play the vendor)</h3>
+<pre>import xinit, xcrypto, xloader, json, struct
+PIN = "123456"
+xinit.set_pin(PIN)
+dev_id, dev_pub = xinit.init(PIN)
+v_priv, v_pub = xcrypto.ecdsa_keygen()
+a_priv, a_pub = xcrypto.ecdsa_keygen()
+xinit.install_anchor(PIN, "vendor", v_pub)
+xinit.install_anchor(PIN, "app", a_pub)
+xinit.install_anchor(PIN, "fw", xcrypto.ecdsa_keygen()[1])
+cert = xcrypto.ecdsa_sign(v_priv, b"xpy-devcert-v1" + dev_id + dev_pub)
+xinit.set_certificate(PIN, cert)
+xinit.finalize(PIN)
+xinit.state()                                   # 'OPERATIONAL'</pre>
+
+<h3>Step 2 · A mini packer (paste mode): the same format as xpy-pack</h3>
+<pre>def pack(ver, code, key=None):
+    files = {"main.py": code}
+    hashes = {n: xcrypto.sha256(d).hex() for n, d in files.items()}
+    m = json.dumps({"app_id": "demo", "version": ver, "entry": "main.py",
+                    "permissions": {}, "files": hashes}).encode()
+    sig = xcrypto.ecdsa_sign(key or a_priv, b"xpy-app-v1" + m)
+    blob = b"XPK1" + struct.pack("&lt;I", len(m)) + m + sig
+    for n, d in files.items():
+        blob += struct.pack("&lt;H", len(n)) + n.encode()
+        blob += struct.pack("&lt;I", len(d)) + d
+    with open("/tmp/demo.xpk", "wb") as f:
+        f.write(blob)
+    return "/tmp/demo.xpk"</pre>
+
+<h3>Step 3 · Install and run</h3>
+<pre>xloader.set_root("/tmp/xl")
+if "demo" in xloader.list(): xloader.remove("demo")   # leftovers from an earlier session
+xloader.install(pack("1.0.0", b"def main():\n    return 42\n"))   # 'demo'
+xloader.list()                                  # ['demo']
+xloader.info("demo")["version"]                 # '1.0.0'
+xloader.run("demo")                             # 42</pre>
+<div class="ok"><b>Works when:</b> the app installs and <code>run()</code> returns 42.</div>
+
+<h3>Step 4 · Attack: wrong signer, same version</h3>
+<pre>k, _ = xcrypto.ecdsa_keygen()
+xloader.install(pack("1.1.0", b"x=1", k))       # ValueError: bad signature
+xloader.install(pack("1.0.0", b"x=1"))          # ValueError: version must be newer than 1.0.0</pre>
+
+<h3>Step 5 · Attack: change a file in flash after install</h3>
+<pre>with open("/tmp/xl/demo/main.py", "ab") as f:
+    f.write(b"\n# evil")
+xloader.run("demo")                             # ValueError: app modified: main.py</pre>
+
+<h3>Step 6 · Attack: leave the sandbox</h3>
+<pre>xloader.install(pack("1.1.0", b"import xinit\ndef main(): return 1\n"))
+xloader.run("demo")                             # ImportError: policy: module 'xinit' not allowed
+xloader.install(pack("1.2.0", b"import os\ndef main(): return os.listdir('/')\n"))
+xloader.run("demo")                             # OSError: policy: read '/' denied</pre>
+<p>Note that <code>import os</code> itself works: the app gets the restricted <code>os</code>, and the <b>read</b> is refused.</p>
+
+<h3>Step 7 · Attack: run forever, then check the cleanup</h3>
+<pre>xloader.install(pack("1.3.0", b"def main():\n    while True: pass\n"))
+xloader.run("demo")                             # KeyboardInterrupt after about 5 s
+import os; os.listdir("/tmp/xl")                # ['.data', 'demo']: no policy left active
+xloader.remove("demo"); xloader.list()          # []</pre>
+<div class="bad"><b>All attacks refused:</b> each line above must fail with the error shown. If one of them returns a value, the protection is broken.</div>
+
+<h3>Step 8 · Board A (read-only)</h3>
+<pre>mpremote connect /dev/ttyUSB0 repl
+import xloader
+xloader.list()                                  # your installed apps, e.g. ['hello', 'sensor']
+xloader.verify("hello")["files"]                # {'main.mpy': '&lt;sha256 hex&gt;'}
+xloader.run("hello")                            # prints Hello from a signed xPython app!  → 'ok'</pre>
+<p>If the REPL is locked by <code>xexec</code>, open the unlock window first with <code>xpy-officer unlock</code>. Building and re-installing <code>apps/hello</code> with <code>xpy-pack</code> answers <i>version must be newer than 1.0.0</i>: that is the downgrade check working. Raise the version in <code>app.json</code> to install it for real.</p>
+
+<div class="note"><b>Verified:</b> Steps 1–7 were run on the PC build of your firmware; every result matched what is written above. Step 8 was not run.</div>
+
+<h2>7. Limits to state in your thesis</h2>
+<table>
+<tr><th>Limit</th><th>Why</th><th>Possible fix</th></tr>
+<tr><td><b>Downgrade after remove:</b> <code>remove()</code> then <code>install()</code> of an old signed version works</td><td>The version is only compared with the copy installed now</td><td>A per-app minimum version in NVS that survives <code>remove()</code>, or a vendor-signed revocation list</td></tr>
+<tr><td>Install is <b>not power-safe</b> between the two renames</td><td>The app is only in <code>.old</code>, and the next install deletes <code>.old</code></td><td>At boot: if <code>.old</code> exists and the app folder is missing, rename it back</td></tr>
+<tr><td>The version check reads <code>manifest.json</code> <b>without verifying</b> it</td><td><code>info()</code> doesn't check the signature</td><td>Use <code>verify(app)</code> to read the old version</td></tr>
+<tr><td><b>Check-then-use gap:</b> files are read again from flash at import, after <code>verify()</code></td><td>Needs a physical attacker writing flash at that moment</td><td>Flash encryption, or import from the bytes already checked</td></tr>
+<tr><td>Apps readable with a <b>flash dump</b></td><td>No flash encryption; <code>.mpy</code> is easy to disassemble</td><td>Flash encryption (SBFE variant)</td></tr>
+<tr><td><code>remove()</code> needs <b>no authorization</b></td><td>No PIN or signature; only the REPL lock protects it</td><td>Require the SO PIN or a signed remove command</td></tr>
+</table>
+
+<h2>Summary</h2>
+<table>
+<tr><th scope="row">Goal</th><td>Only signed, unmodified apps are installed and run, and only inside their declared sandbox</td></tr>
+<tr><th scope="row">Mechanism</th><td><code>.xpk</code> = XPK1 + manifest + ECDSA signature over <code>"xpy-app-v1"</code> + manifest + files; the manifest holds every file's SHA-256</td></tr>
+<tr><th scope="row">Functions</th><td><code>install()</code>, <code>verify()</code>, <code>run()</code>, <code>cleanup()</code>, <code>list()</code>, <code>info()</code>, <code>remove()</code></td></tr>
+<tr><th scope="row">Data flow</th><td>Install: parse → signature → manifest rules → hashes → newer version → stage + rename. Run: verify → /data → policy → timer → main() → cleanup</td></tr>
+<tr><th scope="row">Uses / used by</th><td>Uses xinit, xcrypto, xkeys, xsfs, xpolicy, xwatch · used by xexec and xpy-pack</td></tr>
+<tr><th scope="row">Doesn't stop</th><td>Downgrade after remove, power loss during install, a flash dump of the apps</td></tr>
+</table>
+<p class="meta">Next: Module 6 · <code>xpolicy</code> + <code>xwatch</code>, the sandbox and the time limit.</p>

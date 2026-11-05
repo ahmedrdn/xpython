@@ -13,7 +13,7 @@ import xnet
 import xota
 
 VERSION = "0.1.1"
-PERIOD_S = 10                         # pause between rounds of apps
+PERIOD_S = 20                         # pause between rounds (ThingSpeak free: 1 update / 15 s)
 WDT_MS = 2 * xloader.MAX_TIME_MS + 10000
 LOG_MAX = 4096                        # start a new log after this many bytes
 UNLOCK_WINDOW_MS = 3000
@@ -102,13 +102,27 @@ def _unlock_window():
     return False
 
 
+_started = False
+
+
 def start():
+    """Called at every boot by the firmware's own _boot.py (no boot.py needed).
+    Dev mode ON (or not provisioned): returns at once and the REPL is open.
+    Dev mode OFF: runs all installed apps forever with the REPL locked."""
+    global _started
+    if _started:                      # e.g. an old boot.py calling it a second time
+        return
+    _started = True
     try:
-        print("xPython:", xota.confirm())     # keep a new firmware only if its self-test passes
+        if xinit.state() == "OPERATIONAL":
+            print("xPython:", xota.confirm())  # keep a new firmware only if its self-test passes
+        else:
+            # Not provisioned (or LOCKED): the self-test would fail at every boot and the
+            # board would restart forever. Such a board cannot receive a signed update,
+            # so simply keep the running firmware.
+            xota.keep()
     except Exception as e:
         _log({"app": "-", "status": "ota confirm: " + repr(e)})
-    """Called from boot.py. Returns at once in development mode (REPL open).
-    Otherwise runs all installed apps forever and never returns (REPL locked)."""
     if xinit.state() != "OPERATIONAL" or xinit.dev_mode():
         print("xPython: development mode, REPL available")
         return
@@ -119,6 +133,11 @@ def start():
         micropython.kbd_intr(3)
         return
     print("xPython: OPERATIONAL, REPL locked")
+    try:
+        xnet.connect_wifi()
+    except Exception as e:            # no Wi-Fi saved, or it is not reachable
+        _log({"app": "-", "status": "Wi-Fi: " + repr(e)})
+        xnet.portal()                 # setup page on the board's own hotspot; then restarts
     try:
         xnet.connect()                # open the network early; apps publish quickly
     except Exception as e:

@@ -1,0 +1,6 @@
+# Everything xpython.exe bundles (Python 3.13 or newer, from python.org, with Tcl/Tk)
+pyinstaller>=6.10
+cryptography>=42
+pyserial>=3.5
+mpremote>=1.24
+esptool>=4.7,<5

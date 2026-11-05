@@ -1,0 +1,175 @@
+<h1>Module 4 · xsfs: the secure file system</h1>
+<p class="sub">xPython framework guide, concept edition · goal → functions → data flow → connections → testing · 31 October 2026</p>
+
+<div class="note"><b>In one line:</b> <code>xsfs</code> is a folder where every file is <b>automatically encrypted and sealed</b> when written, and <b>checked and decrypted</b> when read. You use the normal <code>open()</code>, <code>read()</code> and <code>write()</code>; the crypto is invisible.</div>
+
+<h2>1. Goal</h2>
+<p>The ESP32's flash is a separate chip that anyone can read with esptool or a probe. Files saved normally (Wi-Fi password, settings, app data) are stored as <b>plain text</b>. <code>xsfs</code> protects them, so that:</p>
+<ul>
+<li>nobody can <b>read</b> them from the flash (they're encrypted);</li>
+<li>nobody can <b>change</b> them unnoticed (any change breaks the seal);</li>
+<li>nobody can <b>swap</b> one file for another (each seal is tied to its file's name).</li>
+</ul>
+<p><b>Analogy:</b> a safe-deposit box with a <b>clear window</b>. People can see <i>that</i> there are boxes and what's written on their labels (file names), but not what's inside. If anyone forces a box, or moves the contents into another box, the bank notices at once.</p>
+
+<h2>2. How it works: a mount</h2>
+<p><code>xsfs</code> plugs into MicroPython's file system as a <b>mount</b>: a folder that looks normal but is served by <code>xsfs</code>.</p>
+<pre>import xsfs
+xsfs.mount("/secure", key="sfs", root="/.xsfs")</pre>
+<table>
+<tr><th>Argument</th><th>Meaning</th></tr>
+<tr><td><code>"/secure"</code></td><td>The <b>mount point</b>: the folder you and your code use</td></tr>
+<tr><td><code>key="sfs"</code></td><td>The <b>xkeys label</b> of the AES-256 key. Created automatically if it doesn't exist</td></tr>
+<tr><td><code>root="/.xsfs"</code></td><td>Where the <b>sealed files really live</b> on flash</td></tr>
+</table>
+<p>After that, <code>open("/secure/config.txt", "w")</code> works like any file, but what reaches the flash is <code>/.xsfs/config.txt</code>, sealed.</p>
+
+<h3>The sealed file format</h3>
+<pre>[ "XSF1" 4 B | IV 12 B | tag 16 B | ciphertext (same length as your data) ]</pre>
+<p>A sealed file is always <b>your data + 32 bytes</b>. <code>os.stat()</code> through the mount reports the real (plaintext) size.</p>
+
+<h2>3. Main functions</h2>
+<p>You mostly use <b>normal Python file functions</b> inside the mount: <code>xsfs</code> implements them.</p>
+<table>
+<tr><th>What you call</th><th>What xsfs does</th></tr>
+<tr><td><code>xsfs.mount(point, key, root)</code></td><td>Creates the key if needed, creates the root folder, mounts. Returns the file system object</td></tr>
+<tr><td><code>open(path, "r")</code> + <code>read()</code></td><td>Loads the sealed file, <b>checks the seal</b>, decrypts → your data, or <code>OSError EIO</code></td></tr>
+<tr><td><code>open(path, "w")</code> + <code>write()</code> + <code>close()</code></td><td>Collects the data; on close, <b>seals with a fresh random IV</b> and saves</td></tr>
+<tr><td><code>"a"</code> (append) mode</td><td>Opens, adds, re-seals the whole file</td></tr>
+<tr><td><code>os.listdir</code>, <code>os.stat</code>, <code>os.mkdir</code>, <code>os.remove</code></td><td>Passed to the real folder (names visible, sizes adjusted)</td></tr>
+<tr><td><code>os.rename(old, new)</code></td><td>Decrypts and <b>re-seals under the new name</b> (the name is part of the seal)</td></tr>
+<tr><td><code>os.umount(point)</code></td><td>Removes the mount; sealed files stay on flash</td></tr>
+</table>
+
+<h2>4. Data flow</h2>
+<figure>
+<svg width="100%" viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+  <g font-size="12" text-anchor="middle">
+    <text x="20" y="20" text-anchor="start" font-size="13" font-weight="bold" fill="#3C3489">Writing: f.write(data); f.close()</text>
+    <rect x="20" y="32" width="110" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="75" y="54" fill="#2C2C2A">data in RAM</text><text x="75" y="71" font-size="10" fill="#5F5E5A">(max 16 KB)</text>
+    <rect x="150" y="32" width="120" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="210" y="54" fill="#2C2C2A">new random IV</text><text x="210" y="71" font-size="10" fill="#5F5E5A">xcrypto.random(12)</text>
+    <rect x="290" y="32" width="160" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="370" y="52" font-weight="bold" fill="#26215C">xkeys.encrypt</text><text x="370" y="70" font-size="10" fill="#3C3489">key label + IV + AAD = name</text>
+    <rect x="470" y="32" width="90" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="515" y="54" fill="#2C2C2A">write</text><text x="515" y="71" font-size="10" fill="#5F5E5A">file.tmp</text>
+    <rect x="580" y="32" width="80" height="52" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.6"/><text x="620" y="54" fill="#04342C">rename</text><text x="620" y="71" font-size="10" fill="#085041">→ file</text>
+    <g stroke="#5F5E5A" stroke-width="1.2" fill="none" marker-end="url(#ar)"><line x1="130" y1="58" x2="146" y2="58"/><line x1="270" y1="58" x2="286" y2="58"/><line x1="450" y1="58" x2="466" y2="58"/><line x1="560" y1="58" x2="576" y2="58"/></g>
+    <text x="340" y="106" font-size="10.5" fill="#57606a">Write to a temporary file, then rename: a power cut never leaves a half-written file.</text>
+
+    <text x="20" y="148" text-anchor="start" font-size="13" font-weight="bold" fill="#3C3489">Reading: f.read()</text>
+    <rect x="20" y="160" width="130" height="52" rx="6" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.6"/><text x="85" y="182" fill="#2C2C2A">sealed file</text><text x="85" y="199" font-size="10" fill="#5F5E5A">magic | IV | tag | ct</text>
+    <rect x="175" y="160" width="190" height="52" rx="6" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.6"/><text x="270" y="180" font-weight="bold" fill="#26215C">xkeys.decrypt</text><text x="270" y="198" font-size="10" fill="#3C3489">recompute tag with this file's name</text>
+    <rect x="395" y="150" width="265" height="34" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.6"/><text x="527" y="172" fill="#04342C">tag matches → your data</text>
+    <rect x="395" y="192" width="265" height="34" rx="6" fill="#FAECE7" stroke="#993C1D" stroke-width="0.6"/><text x="527" y="214" fill="#4A1B0C">no match → OSError EIO</text>
+    <g stroke="#5F5E5A" stroke-width="1.2" fill="none" marker-end="url(#ar)"><line x1="150" y1="186" x2="171" y2="186"/><line x1="365" y1="180" x2="391" y2="168"/><line x1="365" y1="192" x2="391" y2="208"/></g>
+    <text x="340" y="256" font-size="10.5" fill="#57606a">EIO = "input/output error": the same answer for tampered, swapped, or wrong key,</text>
+    <text x="340" y="272" font-size="10.5" fill="#57606a">so an attacker learns nothing about why it failed.</text>
+  </g>
+</svg>
+<figcaption>Figure 1. Writing and reading a sealed file.</figcaption>
+</figure>
+
+<h3>What each protection stops</h3>
+<table>
+<tr><th>Protection</th><th>Stops</th></tr>
+<tr><td>AES-GCM encryption</td><td>Reading the file from the flash</td></tr>
+<tr><td>The 16-byte tag (seal)</td><td>Changing even one bit</td></tr>
+<tr><td>The file name as AAD</td><td>Copying one valid sealed file over another</td></tr>
+<tr><td>A fresh IV at every save</td><td>Recognizing "the same content as before" from the bytes</td></tr>
+<tr><td>Temp file + rename</td><td>A corrupted file after a power cut while saving</td></tr>
+<tr><td>The key kept by <code>xkeys</code></td><td>Code that reads the key and decrypts elsewhere</td></tr>
+</table>
+
+<h2>5. Who uses xsfs</h2>
+<table>
+<tr><th>User</th><th>Mount point</th><th>Key label</th><th>Real folder</th><th>Stores</th></tr>
+<tr><td><code>xnet</code></td><td><code>/xsys</code></td><td><code>xsys</code></td><td><code>/.xsys</code></td><td>Wi-Fi password, broker address, CA, TLS key + certificate</td></tr>
+<tr><td><code>xloader</code></td><td><code>/data</code> (while an app runs)</td><td><code>a_&lt;hash&gt;</code>, one per app</td><td><code>/apps/.data/&lt;app&gt;</code></td><td>Each app's private data, sealed with its own key</td></tr>
+<tr><td>you / system code</td><td>e.g. <code>/secure</code></td><td><code>sfs</code> (default)</td><td><code>/.xsfs</code> (default)</td><td>Anything you want protected</td></tr>
+</table>
+<p><code>xsfs</code> uses <code>xkeys</code> (encrypt / decrypt by label) and <code>xcrypto</code> (random IVs). Because every app has its <b>own key and folder</b>, one app can't read another's <code>/data</code>, even by copying the files: they'd open with the wrong key, giving EIO.</p>
+
+<h2>6. Test it yourself</h2>
+<p>These steps use their <b>own test key and folders</b> and clean up at the end. Use the paths for where you run them:</p>
+<table>
+<tr><th>Name in the steps</th><th>PC build</th><th>Board A</th></tr>
+<tr><td><code>M</code> (mount point)</td><td><code>"/tmp/xs/secure"</code></td><td><code>"/secure_test"</code></td></tr>
+<tr><td><code>R</code> (sealed folder)</td><td><code>"/tmp/xs/.sealed"</code></td><td><code>"/.sealed_test"</code></td></tr>
+</table>
+<p>On the PC, first run <code>import os; os.mkdir("/tmp/xs")</code> once.</p>
+
+<h3>Step 1 · Mount</h3>
+<pre>import os, xsfs, xkeys
+M, R = "/tmp/xs/secure", "/tmp/xs/.sealed"      # or the board paths
+xsfs.mount(M, key="test_sfs", root=R)
+"test_sfs" in xkeys.list()                      # True: the key was created for you</pre>
+
+<h3>Step 2 · Use it like a normal folder</h3>
+<pre>with open(M + "/config.txt", "w") as f:
+    f.write("wifi_password=Sup3r")
+open(M + "/config.txt").read()                  # 'wifi_password=Sup3r'
+os.listdir(M), os.listdir(R)                    # (['config.txt'], ['config.txt'])</pre>
+
+<h3>Step 3 · Look at what is really on the flash</h3>
+<pre>raw = open(R + "/config.txt", "rb").read()
+raw[:4]                                         # b'XSF1'
+b"Sup3r" in raw                                 # False: the password isn't there
+os.stat(M + "/config.txt")[6], os.stat(R + "/config.txt")[6]   # (19, 51): + 32 bytes</pre>
+
+<h3>Step 4 · Attack: change one bit</h3>
+<pre>b = bytearray(raw); b[-1] ^= 1
+open(R + "/config.txt", "wb").write(b)
+open(M + "/config.txt").read()                  # OSError: [Errno 5] EIO</pre>
+
+<h3>Step 5 · Attack: swap two files</h3>
+<pre>with open(M + "/a.txt", "w") as f: f.write("role=user")
+with open(M + "/b.txt", "w") as f: f.write("role=admin")
+open(R + "/a.txt", "wb").write(open(R + "/b.txt", "rb").read())   # copy b's seal onto a
+open(M + "/a.txt").read()                       # OSError EIO: the seal belongs to "/b.txt"</pre>
+
+<h3>Step 6 · Rename is safe; big files are refused</h3>
+<pre>os.rename(M + "/b.txt", M + "/c.txt")
+open(M + "/c.txt").read()                       # 'role=admin': re-sealed under the new name
+with open(M + "/big.bin", "wb") as f:
+    f.write(bytes(17000))                       # OSError: [Errno 12] ENOMEM (limit 16 KB)</pre>
+
+<h3>Step 7 · Attack: put back an OLD copy (this one is NOT detected)</h3>
+<pre>with open(M + "/limit.txt", "w") as f: f.write("max_temp=50")
+old = open(R + "/limit.txt", "rb").read()       # attacker keeps a copy
+with open(M + "/limit.txt", "w") as f: f.write("max_temp=40")   # you update it
+open(R + "/limit.txt", "wb").write(old)         # attacker puts the old copy back
+open(M + "/limit.txt").read()                   # 'max_temp=50': accepted!</pre>
+<p>The old copy has a genuine seal for the same name, so <code>xsfs</code> can't tell it's old. See §7.</p>
+
+<h3>Step 8 · The wrong key can't open anything</h3>
+<pre>os.umount(M)
+xsfs.mount(M, key="other_key", root=R)
+open(M + "/c.txt").read()                       # OSError EIO</pre>
+
+<h3>Step 9 · Clean up</h3>
+<pre>os.umount(M)
+for n in os.listdir(R): os.remove(R + "/" + n)
+os.rmdir(R)
+xkeys.delete("test_sfs"); xkeys.delete("other_key")</pre>
+
+<div class="note"><b>Verified:</b> these steps were run on the PC build of your firmware; every result matched what is written above, including Step 7's rollback being accepted.</div>
+
+<h2>7. Limits to state in your thesis</h2>
+<table>
+<tr><th>Limit</th><th>Why</th><th>Possible fix</th></tr>
+<tr><td><b>Rollback</b> of a file to an older version isn't detected (Step 7)</td><td>The seal binds data + name, but not <i>which version</i></td><td>Keep a version counter (in NVS, which xinit-style storage could protect) and seal it into the AAD</td></tr>
+<tr><td>File <b>names, sizes and folders</b> are visible</td><td>Only contents are encrypted</td><td>Encrypt names too (more complex)</td></tr>
+<tr><td>Deleting a file isn't detected</td><td>There's no list of which files should exist</td><td>A sealed index file</td></tr>
+<tr><td>Max <b>16 KB</b> per file, whole file in RAM</td><td>The seal covers the whole file at once</td><td>Seal in chunks</td></tr>
+<tr><td>Keys readable with a <b>flash dump</b> (no flash encryption)</td><td>xkeys stores keys in plain NVS</td><td>Flash encryption (stage 3 of secure boot)</td></tr>
+</table>
+
+<h2>Summary</h2>
+<table>
+<tr><th>Goal</th><td>Files that can't be read, changed or swapped, with the normal file API</td></tr>
+<tr><th>Mechanism</th><td>A mount; each file = magic + random IV + tag + AES-GCM ciphertext, with the file name as AAD</td></tr>
+<tr><th>Functions</th><td><code>mount()</code> + normal open / read / write / rename / listdir / remove</td></tr>
+<tr><th>Data flow</th><td>Write → fresh IV → xkeys.encrypt → .tmp → rename. Read → xkeys.decrypt → data or EIO</td></tr>
+<tr><th>Used by</th><td>xnet (<code>/xsys</code>), xloader (each app's <code>/data</code>), your own code</td></tr>
+<tr><th>Doesn't stop</th><td>Rollback to an old copy, deletion, seeing names and sizes, a flash dump of the keys</td></tr>
+</table>
+<p class="meta">Next: Module 5 · <code>xloader</code>, signed app packages.</p>

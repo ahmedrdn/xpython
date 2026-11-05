@@ -125,6 +125,8 @@ def cmd_status(args):
     print(f"PIN   : {'set' if st['pin'] else 'not set'}, {st['tries']} tries left")
     print(f"dev   : {'on (REPL open)' if st['dev'] else 'off'}")
     print(f"id    : {st['id'] or '-'}")
+    if st["id"]:
+        print(f"setup : Wi-Fi page hotspot xPython-{st['id'][:6]}, password xpy-{st['id'][:8]}")
     for name, filename in KEY_FILES.items():
         dev = st["anchors"][name]
         if dev is None:
@@ -199,21 +201,16 @@ def cmd_reset(args):
     run(args.port, f'xinit.reset({pin!r})\nprint("XPY:1")')
     print("The device is BLANK again.")
 
-BOOT_PY = "import xexec\nxexec.start()\n"
-
-
 def cmd_devmode(args):
     pin = getpass.getpass("SO PIN: ")
     on = args.value == "on"
-    run(args.port, f'xinit.set_dev_mode({pin!r}, {on})\nprint("XPY:1")')
+    # xPython starts by itself (frozen _boot.py); an old autostart boot.py is removed
+    run(args.port, f'xinit.set_dev_mode({pin!r}, {on})\n'
+        'import os\ntry:\n    t = open("/boot.py").read()\n'
+        '    if "xexec" in t or "autostart" in t:\n        os.remove("/boot.py")\n'
+        'except OSError:\n    pass\nprint("XPY:1")')
     print("Development mode ON: the REPL stays open." if on else
-          "Development mode OFF: with autostart on, the REPL locks at the next boot.")
-
-
-def cmd_autostart(args):
-    text = BOOT_PY if args.value == "on" else "# xPython autostart off\n"
-    run(args.port, f'with open("/boot.py", "w") as f:\n    f.write({text!r})\nprint("XPY:1")')
-    print(f"Autostart {args.value}: takes effect at the next boot.")
+          "Development mode OFF: at the next restart the board runs its apps and the REPL locks.")
 
 
 def cmd_unlock(args):
@@ -243,7 +240,7 @@ def cmd_unlock(args):
             if b"development mode, REPL available" in out:
                 print("The device is not locked.")
                 return
-    sys.exit("No unlock window seen. Is autostart on and the device OPERATIONAL?")
+    sys.exit("No unlock window seen. Is the device OPERATIONAL with dev mode off?")
 
 
 def cmd_netconfig(args):
@@ -265,6 +262,86 @@ def cmd_nettest(args):
         'ip, topic = xnet.test("hello from xPython over TLS")\n'
         'print("XPY:" + json.dumps([ip, topic]))')
     print(f"Device IP {r[0]}: published to {r[1]}")
+
+
+def read_credentials(path):
+    """An MQTT credentials file (plain text "username = ..." lines, or mqtt_secrets.h) -> dict."""
+    found = {}
+    for line in Path(path).expanduser().read_text().splitlines():
+        low = line.lower()
+        if '"' in line:
+            value = line.split('"')[1]
+        elif "=" in line:
+            value = line.split("=", 1)[1]
+        elif ":" in line:
+            value = line.split(":", 1)[1]
+        else:
+            continue
+        value = value.strip()
+        for key, word in (("client_id", "client"), ("username", "user"), ("password", "pass")):
+            if word in low and value and key not in found:
+                found[key] = value
+                break
+    if not found:
+        sys.exit(f"{path}: no client ID, username or password found")
+    for k in ("client_id", "username", "password"):
+        found.setdefault(k, "")
+    return found
+
+
+def load_ca(path):
+    """A CA certificate file (PEM or DER) -> DER bytes."""
+    from cryptography import x509
+    data = Path(path).expanduser().read_bytes()
+    ca = (x509.load_pem_x509_certificate(data) if b"BEGIN CERTIFICATE" in data
+          else x509.load_der_x509_certificate(data))
+    print(f"  CA: {ca.subject.rfc4514_string()}")
+    return ca.public_bytes(serialization.Encoding.DER)
+
+
+def save_cloud(port, pin, host, broker_port, ca_der, topic, client_id, username, password, fields,
+               protocol="mqtt", key="", header="", name="default"):
+    run(port, "import xnet\n"
+        f"xnet.configure_cloud({pin!r}, {host!r}, {int(broker_port)}, bytes.fromhex({ca_der.hex()!r}), "
+        f"{topic!r}, {client_id!r}, {username!r}, {password!r}, {fields!r}, "
+        f"{protocol!r}, {key!r}, {header!r}, {name!r})\n"
+        'print("XPY:1")')
+    print(f"Service '{name}' saved on the device (sealed): {protocol.upper()} {host}:{broker_port}, {topic}")
+
+
+def cmd_cloudconfig(args):
+    """Send app data to a cloud service: MQTT (TLS), HTTP (HTTPS) or CoAP (DTLS)."""
+    pin = getpass.getpass("SO PIN: ")
+    protocol = (input("Protocol (mqtt, http, coap) [mqtt]: ").strip() or "mqtt").lower()
+    default_port = {"mqtt": "8883", "http": "443", "coap": "5684"}.get(protocol, "8883")
+    host = input("Host: ").strip()
+    broker_port = input(f"Port [{default_port}]: ").strip() or default_port
+    topic = input("Topic or path ({device} {app} {sub} {key} are filled in): ").strip()
+    fields = input("Field names, comma-separated (Enter = send the message as it is): ").strip()
+    cred = {"client_id": "", "username": "", "password": ""}
+    key = header = ""
+    if protocol == "mqtt":
+        cred_file = input("Credentials file (Enter = type them): ").strip()
+        if cred_file:
+            cred = read_credentials(cred_file)
+            print(f"  read client ID {cred['client_id']} and username {cred['username']}")
+        else:
+            cred = {"client_id": input("MQTT client ID (Enter = device name): ").strip(),
+                    "username": input("MQTT username (Enter = none): ").strip(),
+                    "password": getpass.getpass("MQTT password (Enter = none): ")}
+    else:
+        key = getpass.getpass("Key / API key (Enter = none): ")
+        if protocol == "http":
+            header = input("Header line using {key} (Enter = none): ").strip()
+    ca_file = input("CA certificate file: ").strip()
+    save_cloud(args.port, pin, host, broker_port, load_ca(ca_file), topic,
+               cred["client_id"], cred["username"], cred["password"], fields, protocol, key, header)
+
+
+def cmd_cloudtest(args):
+    r = run(args.port, "import xnet\n"
+        'print("XPY:" + json.dumps(xnet.cloud_test()))')
+    print(f"Test message sent to {r}")
 
 
 def cmd_netcert(args):
@@ -315,9 +392,10 @@ def main():
     for name, fn in [("keygen", cmd_keygen), ("status", cmd_status),
                     ("provision", cmd_provision), ("reset", cmd_reset),
                     ("unlock", cmd_unlock), ("netconfig", cmd_netconfig),
-                    ("nettest", cmd_nettest), ("netcert", cmd_netcert)]:
+                    ("nettest", cmd_nettest), ("netcert", cmd_netcert),
+                    ("cloudconfig", cmd_cloudconfig), ("cloudtest", cmd_cloudtest)]:
         sub.add_parser(name).set_defaults(fn=fn)
-    for name, fn in [("devmode", cmd_devmode), ("autostart", cmd_autostart)]:
+    for name, fn in [("devmode", cmd_devmode)]:
         p = sub.add_parser(name)
         p.add_argument("value", choices=["on", "off"])
         p.set_defaults(fn=fn)

@@ -1,0 +1,6 @@
+{
+  "app_id": "dht11",
+  "version": "1.2.0",
+  "entry": "main.py",
+  "permissions": {"time_ms": 15000}
+}

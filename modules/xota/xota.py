@@ -138,6 +138,12 @@ def self_test():
     }
 
 
+def keep():
+    """Keep the running firmware without the self-test (board not provisioned)."""
+    if esp32 is not None:
+        esp32.Partition.mark_app_valid_cancel_rollback()
+
+
 def confirm():
     """Keep the running firmware if its self-test passes; otherwise reset,
     and the bootloader rolls back to the previous firmware."""

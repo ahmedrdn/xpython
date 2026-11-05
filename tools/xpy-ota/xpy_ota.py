@@ -109,9 +109,10 @@ def cmd_serve(args):
             # so one stuck client can't block everyone else.
             return ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(OTA_DIR))
+    folder = Path(getattr(args, "dir", None) or OTA_DIR)     # where firmware.xfw is
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(folder))
     httpd = Server(("0.0.0.0", args.ota_port), handler)
-    print(f"Serving {OTA_DIR} over HTTPS (mutual TLS) on port {args.ota_port}. Ctrl+C to stop.")
+    print(f"Serving {folder / 'firmware.xfw'} over HTTPS (mutual TLS) on port {args.ota_port}. Ctrl+C to stop.")
     httpd.serve_forever()
 
 def cmd_status(args):
@@ -154,8 +155,11 @@ def main():
     parser.add_argument("--port", default="/dev/ttyUSB0")
     parser.add_argument("--ota-port", type=int, default=8443)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, fn in [("serve", cmd_serve), ("push", cmd_push), ("status", cmd_status)]:
+    for name, fn in [("push", cmd_push), ("status", cmd_status)]:
         sub.add_parser(name).set_defaults(fn=fn)
+    sv = sub.add_parser("serve")
+    sv.add_argument("--dir", help="folder that holds firmware.xfw (default: build/ota)")
+    sv.set_defaults(fn=cmd_serve)
     b = sub.add_parser("build")
     b.add_argument("--key", default=str(FW_KEY), help="signing key (default: keys/fw_sign.pem)")
     b.add_argument("--tamper-after", action="store_true", help="test: change a byte after signing")

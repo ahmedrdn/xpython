@@ -1,15 +1,15 @@
 # xloader: xPython Secure Loader (frozen into the firmware).
-# Installs and runs only app packages signed with the device's "app" anchor,
-# and runs each app under its manifest's permissions (enforced by xpolicy).
+# Secure deployment: installs and runs only app packages signed with the device's
+# "app" anchor, re-checks their files before every run, gives each app its own
+# encrypted /data folder, and stops an app that runs longer than its time limit.
+# A signed app is trusted: it can use any MicroPython module (machine, dht, ...).
 import os
 import sys
 import json
 import struct
-import builtins
 import xcrypto
 import xinit
 import xkeys
-import xpolicy
 import xsfs
 import xwatch
 
@@ -21,8 +21,6 @@ RESERVED = ("manifest.json", "manifest.sig")
 DEFAULT_TIME_MS = 5000            # time limit when the manifest gives none
 MAX_TIME_MS = 30000
 _root = "/apps"
-_real_open = open                 # saved before any app policy is active
-_real_import = __import__
 
 
 def version():
@@ -72,27 +70,18 @@ def _parse_version(v):
 
 
 def _check_permissions(p):
+    """Used: "time_ms" and "service"; other keys (from older packages) are ignored."""
     if not isinstance(p, dict):
         raise ValueError("bad permissions")
-    fs = p.get("fs", {})
-    if not isinstance(fs, dict):
-        raise ValueError("bad fs permission")
-    for kind in ("read", "write"):
-        for path in fs.get(kind, []):
-            if not isinstance(path, str) or not path.startswith("/") or ".." in path:
-                raise ValueError("bad path in permissions: " + str(path))
-    for kind in ("keys", "modules"):
-        for item in p.get(kind, []):
-            if not isinstance(item, str):
-                raise ValueError("bad " + kind + " in permissions")
+    if "service" in p:
+        n = p["service"]
+        if not (isinstance(n, str) and 0 < len(n) <= 15
+                and all(c.isalpha() or c.isdigit() or c == "_" for c in n)):
+            raise ValueError("service: 1-15 letters, digits or _")
     if "time_ms" in p:
         t = p["time_ms"]
         if not isinstance(t, int) or not 1 <= t <= MAX_TIME_MS:
             raise ValueError("time_ms must be 1.." + str(MAX_TIME_MS))
-    for t in p.get("publish", []):
-        if (not isinstance(t, str) or not 0 < len(t) <= 64 or t.startswith("/")
-                or "+" in t or ".." in t or ("#" in t and not (t == "#" or t.endswith("/#")))):
-            raise ValueError("bad publish topic in permissions: " + str(t))
 
 
 def _data_key(app):
@@ -159,27 +148,7 @@ def _check_files(m, files):
             raise ValueError("hash mismatch: " + name)
 
 
-# ---------- Policy and private data ----------
-def _policy(app, m):
-    """Turn the manifest's permissions into the dict xpolicy enforces."""
-    # Note: this file defines its own list(), so copies are made with [x for x in ...]
-    p = m["permissions"]
-    fs = p.get("fs", {})
-    modules = [n.rsplit(".", 1)[0] for n in m["files"]] + [x for x in p.get("modules", [])]
-    if p.get("keys"):
-        modules.append("xkeys")
-    if p.get("publish"):
-        modules.append("xmsg")
-    return {
-        "app": app,
-        "modules": modules,
-        "read": [x for x in fs.get("read", [])],
-        "write": [x for x in fs.get("write", [])] + ["/data"],   # its private folder
-        "keys": [x for x in p.get("keys", [])] + [_data_key(app)],
-        "publish": [x for x in p.get("publish", [])],
-    }
-
-
+# ---------- Private data ----------
 def _mount_data(app):
     base = _root + "/.data"
     if not _exists(base):
@@ -282,18 +251,25 @@ def verify(app):
     return m
 
 
-_running = None          # (app folder, modules loaded before) while an app runs
+_running = None          # (app ID, app folder, modules loaded before, service) while an app runs
+
+
+def running():
+    """The ID of the app that is running now, or None (used by xmsg)."""
+    return _running[0] if _running else None
+
+
+def service():
+    """The cloud service the running app chose in its app.json, or None (= default)."""
+    return _running[3] if _running else None
 
 
 def _cleanup():
     """Undo everything run() set up. Safe to call more than once."""
     global _running
     xwatch.disarm()                             # first: no more timeout interrupts
-    xpolicy.deactivate()
-    builtins.open = _real_open
-    builtins.__import__ = _real_import
     if _running is not None:
-        d, before = _running
+        _, d, before, _ = _running
         _running = None
         if sys.path and sys.path[0] == d:
             sys.path.pop(0)
@@ -303,26 +279,23 @@ def _cleanup():
 
 
 def cleanup():
-    """Make sure no app policy, time limit or /data mount is left active."""
+    """Make sure no time limit or /data mount is left active."""
     _cleanup()
 
 
 def run(app):
-    """Verify the app, then run its main() under its own policy and time limit."""
+    """Verify the app, then run its main() with its time limit."""
     global _running
-    if xpolicy.active() is not None:
-        raise ValueError("another app is running: " + xpolicy.active())
+    if _running is not None:
+        raise ValueError("another app is running: " + _running[0])
     m = verify(app)
     limit = m["permissions"].get("time_ms", DEFAULT_TIME_MS)
     d = _root + "/" + app
     _mount_data(app)
     for name in m["files"]:                     # forget any old copies of its modules
         sys.modules.pop(name.rsplit(".", 1)[0], None)
-    _running = (d, set(sys.modules))
+    _running = (app, d, set(sys.modules), m["permissions"].get("service"))
     sys.path.insert(0, d)
-    builtins.open = xpolicy.open                # swap in the policy versions
-    builtins.__import__ = xpolicy.import_hook
-    xpolicy.activate(_policy(app, m))
     try:
         xwatch.arm(limit)                       # start the clock
         mod = __import__(m["entry"].rsplit(".", 1)[0])

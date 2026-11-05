@@ -1,4 +1,4 @@
-import sys, os, json, struct, xinit, xcrypto, xloader, xpolicy, xexec
+import sys, os, json, struct, xinit, xcrypto, xloader, xexec
 
 PIN = "123456"
 ESP = sys.platform == "esp32"
@@ -84,7 +84,7 @@ print(r)
 assert r["status"] == "out of memory"
 
 # 5. After all that, everything still works normally
-assert xpolicy.active() is None
+assert xloader.running() is None
 assert xexec.run_app("good")["result"] == 42
 statuses = [e["status"].split(":")[0] for e in xexec.log()]
 assert statuses == ["ok", "crash", "timeout", "out of memory", "ok"], statuses

@@ -1,0 +1,1 @@
+{"app_id": "dht11_mqtt", "version": "1.0.0", "entry": "main.py", "permissions": {"service": "tb_mqtt", "time_ms": 20000}}

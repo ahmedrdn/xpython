@@ -4,3 +4,6 @@ keys/
 server/
 build/
 *.xpk
+# MQTT broker credentials (contain passwords)
+*credentials*.txt
+mqtt_secrets.h
