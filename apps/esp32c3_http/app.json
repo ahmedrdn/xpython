@@ -1,0 +1,1 @@
+{"app_id": "esp32c3_http", "version": "1.0.0", "entry": "main.py", "permissions": {"service": "esp32c3_http", "time_ms": 20000}}

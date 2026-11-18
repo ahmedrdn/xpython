@@ -13,7 +13,7 @@ import xkeys
 import xsfs
 import xwatch
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MAGIC = b"XPK1"
 SIG_LABEL = b"xpy-app-v1"
 MAX_PACKAGE = 64 * 1024
@@ -165,8 +165,26 @@ def _umount_data():
 
 
 # ---------- Public functions ----------
-def install(path):
-    """Verify and install a .xpk package. Returns the app id."""
+def _recover():
+    """A power cut between the two renames in install() leaves the old version in .old
+    and no app folder: put it back. Otherwise .old is just a leftover: delete it."""
+    old_dir = _root + "/.old"
+    if not _exists(old_dir):
+        return
+    try:
+        with open(old_dir + "/manifest.json", "rb") as f:
+            app = json.loads(f.read())["app_id"]
+        if not _exists(_root + "/" + app):
+            os.rename(old_dir, _root + "/" + app)
+            return
+    except (OSError, ValueError, KeyError):
+        pass
+    _rmtree(old_dir)
+
+
+def install(path, expect=None):
+    """Verify and install a .xpk package. Returns the app id.
+    expect: the app this package must be (updates over the air: never a different app)."""
     if xinit.state() != "OPERATIONAL":
         raise ValueError("device must be OPERATIONAL")
     if os.stat(path)[6] > MAX_PACKAGE:
@@ -178,6 +196,8 @@ def install(path):
     _check_files(m, files)
 
     app = m["app_id"]
+    if expect is not None and app != expect:
+        raise ValueError("package is " + app + ", not " + expect)
     old = info(app)
     if old and _parse_version(m["version"]) <= _parse_version(old["version"]):
         raise ValueError("version must be newer than " + old["version"])
@@ -215,6 +235,7 @@ def info(app):
 
 
 def list():
+    _recover()
     try:
         return sorted(e[0] for e in os.ilistdir(_root) if not e[0].startswith("."))
     except OSError:

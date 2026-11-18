@@ -1,0 +1,12 @@
+{
+    "deploy": ["../deploy.md"],
+    "deploy_options": {"flash_offset": "0x0"},
+    "docs": "",
+    "features": ["BLE", "External Flash", "WiFi"],
+    "images": [],
+    "mcu": "esp32s3",
+    "product": "xPython ESP32-S3 (N16R8)",
+    "thumbnail": "",
+    "url": "https://www.espressif.com/en/products/socs/esp32-s3",
+    "vendor": "Espressif"
+}

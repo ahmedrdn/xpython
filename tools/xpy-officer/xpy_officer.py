@@ -11,6 +11,7 @@ import argparse
 import datetime
 import getpass
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +22,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import (
     decode_dss_signature, encode_dss_signature)
 
-ROOT = Path(__file__).resolve().parents[2]          # ~/xpython
+# The xPython folder (keys/, server/, apps/, build/ ...). XPY_ROOT is set by the packed
+# Windows app (xpython.exe), whose data folder is the folder of the .exe.
+ROOT = Path(os.environ.get("XPY_ROOT") or Path(__file__).resolve().parents[2])
+# How to run mpremote: the command, or (packed app) the .exe itself with --mpremote
+MPREMOTE = json.loads(os.environ.get("XPY_MPREMOTE", '["mpremote"]'))
+TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}     # same on Windows and Linux
 KEYS = ROOT / "keys"
 DEVICES = ROOT / "devices"
 KEY_FILES = {"vendor": "vendor_root.pem", "app": "app_sign.pem", "fw": "fw_sign.pem"}
@@ -65,11 +71,13 @@ def verify_raw(pub65, data, sig64):
 
 
 # ---------- Talking to the device ----------
-def run(port, code):
-    """Run MicroPython code on the device and return the JSON it prints after 'XPY:'."""
+def run(port, code, resume=False):
+    """Run MicroPython code on the device and return the JSON it prints after 'XPY:'.
+    resume=True: no soft reset first. Needed right after provisioning: a soft reset would
+    start xexec, which locks the REPL of an OPERATIONAL board (development mode off)."""
     script = "import xinit, json\n" + code
-    p = subprocess.run(["mpremote", "connect", port, "exec", script],
-                       capture_output=True, text=True)
+    p = subprocess.run([*MPREMOTE, "connect", port, *(["resume"] if resume else []), "exec", script],
+                       capture_output=True, **TEXT)
     out = p.stdout + p.stderr
     for line in out.splitlines():
         if line.startswith("XPY:"):
@@ -78,7 +86,7 @@ def run(port, code):
     raise DeviceError(lines[-1] if lines else "no response from the device")
 
 
-def device_status(port):
+def device_status(port, resume=False):
     return run(port,
         'd = xinit.device_id()\n'
         'c = xinit.certificate()\n'
@@ -88,7 +96,7 @@ def device_status(port):
         '    a[n] = k.hex() if k else None\n'
         'print("XPY:" + json.dumps({"state": xinit.state(), "pin": xinit.has_pin(),\n'
         '    "tries": xinit.tries_left(), "dev": xinit.dev_mode(), "id": d.hex() if d else None,\n'
-        '    "anchors": a, "cert": [x.hex() for x in c] if c else None}))')
+        '    "anchors": a, "cert": [x.hex() for x in c] if c else None}))', resume)
 
 
 def ask_new_pin():
@@ -116,7 +124,7 @@ def cmd_keygen(args):
             serialization.NoEncryption()))
         path.chmod(0o600)                       # readable by you only
         print(f"{filename}: created")
-    print("Back up the keys/ folder outside this VM now.")
+    print(f"Keys are in {KEYS}. Back up that folder now (USB stick), and keep it private.")
 
 
 def cmd_status(args):
@@ -144,6 +152,87 @@ def cmd_status(args):
         print(f"cert  : {'valid' if ok else 'INVALID'}")
     else:
         print("cert  : none")
+
+
+BOARD_INFO = """
+import os, gc, time, machine, esp, esp32, xfw
+u = os.uname()
+gc.collect()
+r = {"board": u.machine, "micropython": u.release, "fw_tag": getattr(xfw, "TAG", ""),
+     "fw": xfw.VERSION, "cpu_mhz": machine.freq() // 1000000, "flash": esp.flash_size(),
+     "mac": machine.unique_id().hex(), "uptime_s": time.ticks_ms() // 1000,
+     "heap": [gc.mem_free() + gc.mem_alloc(), gc.mem_free()],
+     "idf_heap": [sum(h[0] for h in esp32.idf_heap_info(esp32.HEAP_DATA)),
+                  sum(h[1] for h in esp32.idf_heap_info(esp32.HEAP_DATA))]}
+p = esp32.Partition(esp32.Partition.RUNNING).info()
+r["slot"] = [p[4], p[2], p[3]]
+try:
+    v = os.statvfs("/")
+    r["fs"] = [v[0] * v[2], v[0] * v[3]]
+except OSError:
+    r["fs"] = None
+try:
+    import xgate
+    r["role"] = [xgate.role(), xgate.link()]
+except Exception:
+    r["role"] = None
+mods = {}
+for n in ("xexec", "xnet", "xgate", "xota", "xloader", "xsfs"):
+    try:
+        mods[n] = __import__(n).VERSION
+    except Exception:
+        pass
+r["modules"] = mods
+print("XPY:" + json.dumps(r))
+"""
+
+
+def _kb(n):
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n // 1024} KB"
+
+
+def cmd_boardinfo(args):
+    """The board's chip, firmware, memory and flash. Needs the REPL (development mode on);
+    if it is locked, falls back to esptool, which reads the chip itself (and restarts it)."""
+    try:
+        r = run(args.port, BOARD_INFO)
+    except DeviceError as e:
+        print(f"The REPL did not answer ({e}).")
+        print("Reading the chip with esptool instead (the board restarts afterwards)...")
+        return _esptool_info(args.port)
+    mac = ":".join(r["mac"][i:i + 2] for i in range(0, len(r["mac"]), 2))
+    print(f"board      : {r['board']}")
+    print(f"firmware   : {r['fw_tag'] or r['fw']}   (MicroPython {r['micropython']})")
+    print(f"CPU        : {r['cpu_mhz']} MHz")
+    print(f"flash      : {_kb(r['flash'])}")
+    total, free = r["heap"]
+    print(f"Python heap: {_kb(total)} total, {_kb(free)} free"
+          + ("   (in PSRAM)" if total > 1048576 else ""))
+    print(f"IDF heap   : {_kb(r['idf_heap'][0])} total, {_kb(r['idf_heap'][1])} free   (Wi-Fi, TLS)")
+    name, addr, size = r["slot"]
+    print(f"running    : {name} at {hex(addr)} ({_kb(size)} slot)")
+    if r["fs"]:
+        print(f"files      : {_kb(r['fs'][0])} total, {_kb(r['fs'][1])} free")
+    print(f"MAC        : {mac}")
+    if r["role"]:
+        role, link = r["role"]
+        print(f"role       : {role}" + (f", link {link}" if role == "device" else ""))
+    print(f"up for     : {r['uptime_s'] // 3600} h {r['uptime_s'] // 60 % 60} min")
+    print("modules    : " + ", ".join(f"{k} {v}" for k, v in sorted(r["modules"].items())))
+    return r
+
+
+def _esptool_info(port):
+    """Chip type, revision, features, crystal, MAC and flash size, from the ROM bootloader."""
+    try:
+        import esptool                                  # pip package (bundled in xpython.exe)
+        esptool.main(["--port", port, "flash_id"])
+        return
+    except ImportError:
+        pass
+    p = subprocess.run(["bash", "-c", "source esp-idf/export.sh > /dev/null && esptool.py --port "
+                        + port + " flash_id"], cwd=ROOT, capture_output=True, **TEXT)
+    print((p.stdout + p.stderr).strip())
 
 
 def cmd_provision(args):
@@ -192,6 +281,13 @@ def cmd_provision(args):
     }
     (DEVICES / f"{dev_id.hex()}.json").write_text(json.dumps(record, indent=2))
     print(f"Done: the device is OPERATIONAL. Record saved in devices/{dev_id.hex()}.json")
+
+    # 5. Its TLS certificate for mutual TLS (local broker, update server). The network CA
+    #    (the "server certificates") is made once, the first time it is needed.
+    if not ((KEYS / "net_ca.key").exists() and (ROOT / "server" / "ca.crt").exists()):
+        print("No server certificates yet: creating them (once).")
+        cmd_netca(args)
+    cmd_netcert(args, pin=pin, resume=True)     # no soft reset: that would lock the REPL now
 
 
 def cmd_reset(args):
@@ -344,20 +440,91 @@ def cmd_cloudtest(args):
     print(f"Test message sent to {r}")
 
 
-def cmd_netcert(args):
+def cmd_netca(args):
+    """Once: make the network CA (keys/net_ca.key, server/ca.crt) and the PC server's
+    certificate (server/broker.key, server/broker.crt, name "xpython-broker"), used by the
+    local broker and the OTA update server for mutual TLS. Existing files are kept."""
+    import datetime as dt
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    server = ROOT / "server"
+    KEYS.mkdir(exist_ok=True)
+    server.mkdir(exist_ok=True)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def save_key(path, key):
+        path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                           serialization.NoEncryption()))
+        path.chmod(0o600)
+
+    ca_key_path, ca_crt_path = KEYS / "net_ca.key", server / "ca.crt"
+    if ca_key_path.exists() and ca_crt_path.exists():
+        print("network CA: exists, kept")
+        ca_key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
+        ca_cert = x509.load_pem_x509_certificate(ca_crt_path.read_bytes())
+    elif ca_crt_path.exists():
+        sys.exit("The network CA's secret key keys/net_ca.key is missing (only server/ca.crt is here).\n"
+                 "Copy keys/net_ca.key from the PC where you created it: a certificate alone can't sign.")
+    else:
+        rebuild = ca_key_path.exists()          # key kept, certificate lost: make it again from the key
+        ca_key = (serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None) if rebuild
+                  else ec.generate_private_key(ec.SECP256R1()))
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "xPython network CA")])
+        ski = x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key())
+        ca_cert = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+                   .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+                   .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=3650))
+                   .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                   .add_extension(x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+                                  critical=True)
+                   .add_extension(ski, critical=False)
+                   .add_extension(x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski),
+                                  critical=False)
+                   .sign(ca_key, hashes.SHA256()))
+        ca_crt_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+        if rebuild:
+            print(f"network CA: certificate rebuilt from {ca_key_path} ({ca_crt_path}). Same key and name,\n"
+                  "so the boards' TLS certificates and the CA saved on them stay valid.")
+        else:
+            save_key(ca_key_path, ca_key)
+            print(f"network CA: created ({ca_key_path}, {ca_crt_path}), valid 10 years")
+
+    key_path, crt_path = server / "broker.key", server / "broker.crt"
+    if key_path.exists() and crt_path.exists():
+        print("server certificate: exists, kept")
+        return
+    key = ec.generate_private_key(ec.SECP256R1())
+    crt = (x509.CertificateBuilder()
+           .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "xpython-broker")]))
+           .issuer_name(ca_cert.subject).public_key(key.public_key())
+           .serial_number(x509.random_serial_number())
+           .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=825))
+           .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+           .add_extension(x509.SubjectAlternativeName([x509.DNSName("xpython-broker")]), critical=False)
+           .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+           .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                          critical=False)
+           .sign(ca_key, hashes.SHA256()))
+    save_key(key_path, key)
+    crt_path.write_bytes(crt.public_bytes(serialization.Encoding.PEM))
+    print(f"server certificate: created ({crt_path}, name xpython-broker), valid about 2 years")
+    print("Keep keys/net_ca.key and server/broker.key private, and back them up.")
+
+
+def cmd_netcert(args, pin=None, resume=False):
     """Give the device a TLS certificate from the network CA (for mutual TLS)."""
     import datetime as dt
     from cryptography import x509
     from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
-    st = device_status(args.port)
+    st = device_status(args.port, resume)
     if not st["id"]:
         sys.exit("Provision the device first.")
-    pin = getpass.getpass("SO PIN: ")
+    pin = pin or getpass.getpass("SO PIN: ")
     name = "xpy-" + st["id"][:12]                       # also its MQTT name and topic prefix
 
     # 1. The device makes its TLS key pair and sends only the public key
     pub_hex = run(args.port, "import xnet\n"
-                  f'print("XPY:" + json.dumps(xnet.tls_keygen({pin!r}).hex()))')
+                  f'print("XPY:" + json.dumps(xnet.tls_keygen({pin!r}).hex()))', resume)
     pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes.fromhex(pub_hex))
 
     # 2. The network CA signs a client certificate for that public key
@@ -373,23 +540,117 @@ def cmd_netcert(args):
             .not_valid_after(now + dt.timedelta(days=730))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                           critical=False)
             .sign(ca_key, hashes.SHA256()))
 
     # 3. Install it on the device; keep a copy in the register
     der = cert.public_bytes(serialization.Encoding.DER)
     run(args.port, "import xnet\n"
         f"xnet.set_tls_cert({pin!r}, bytes.fromhex({der.hex()!r}))\n"
-        'print("XPY:1")')
+        'print("XPY:1")', resume)
     DEVICES.mkdir(exist_ok=True)
     (DEVICES / f"{st['id']}-tls.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     print(f"TLS certificate issued: CN={name}, valid 2 years (devices/{st['id']}-tls.crt)")
     
 
+def cmd_gateway(args):
+    """Make this board a gateway, a device that sends through a gateway, or neither."""
+    pin = getpass.getpass("SO PIN: ")
+    gw = (getattr(args, "gateway_id", "") or "").strip()
+    devices = (getattr(args, "devices", "") or "").strip()
+    if args.value == "device" and not gw:
+        gw = input("Gateway ID (run 'gwstatus' on the gateway board to see it): ").strip()
+    link = getattr(args, "link", "espnow") or "espnow"
+    r = run(args.port, "import xgate\n"
+        f"print('XPY:' + json.dumps(xgate.configure({pin!r}, {args.value!r}, {gw!r}, {devices!r}, {link!r})))")
+    if r["role"] == "device":
+        if r.get("link") == "wifi":
+            print(f"This board is now a DEVICE: its apps send through gateway {r['gateway'][:12]}... over Wi-Fi (UDP).")
+            print("It needs the Wi-Fi of the gateway's network saved (Network tab), but no cloud services.")
+        else:
+            print(f"This board is now a DEVICE: its apps send through gateway {r['gateway'][:12]}... over ESP-NOW.")
+            print("It needs no Wi-Fi.")
+        print("Lock it (dev mode off) and restart to start.")
+    elif r["role"] == "gateway":
+        who = ", ".join(r["devices"]) if r["devices"] else "every device certified by your vendor key"
+        print(f"This board is now a GATEWAY (listens on ESP-NOW and on Wi-Fi). It accepts: {who}.")
+        print("It needs Wi-Fi and the cloud services the devices' apps use. Lock it and restart to start.")
+    else:
+        print("Gateway role removed: the board uses its own Wi-Fi again.")
+
+
+def cmd_gwstatus(args):
+    r = run(args.port, "import xgate\nd = xinit.device_id()\n"
+        "print('XPY:' + json.dumps({'id': d.hex() if d else None, 'cfg': xgate.config()}))")
+    cfg = r["cfg"]
+    print(f"board ID : {r['id'] or '-'}")
+    print(f"role     : {cfg.get('role', 'off')}")
+    if cfg.get("role") == "device":
+        print(f"gateway  : {cfg['gateway']}")
+        print(f"link     : {cfg.get('link', 'espnow')}")
+    if cfg.get("role") == "gateway":
+        print(f"accepts  : {', '.join(cfg.get('devices') or []) or 'every device certified by your vendor key'}")
+
+
+def cmd_gwdevices(args):
+    """The devices that joined this gateway (read from the gateway board)."""
+    d = run(args.port, 'import xgate\nprint("XPY:" + json.dumps(xgate.devices()))')
+    if not d:
+        print("No device has joined this gateway yet (or this board is not a gateway).")
+    for k, v in sorted(d.items(), key=lambda kv: kv[1].get("last", ""), reverse=True):
+        print(f"{k}  {v['link']:6}  {v['address']:21}  last joined {v['last']}  ({v['joins']} joins)")
+    return d
+
+
+# ---------- Wi-Fi networks (several saved, sealed on the board) ----------
+def wifi_scan(port):
+    """Networks the board sees, strongest first: [{"ssid", "rssi", "security", "saved"}]."""
+    return run(port, 'import xnet\nprint("XPY:" + json.dumps(xnet.wifi_scan()))')
+
+
+def wifi_saved(port):
+    return run(port, 'import xnet\nprint("XPY:" + json.dumps(xnet.wifi_saved()))')
+
+
+def wifi_add(port, pin, ssid, password):
+    return run(port, f'import xnet\nprint("XPY:" + json.dumps(xnet.wifi_add({pin!r}, {ssid!r}, {password!r})))')
+
+
+def wifi_remove(port, pin, ssid):
+    return run(port, f'import xnet\nprint("XPY:" + json.dumps(xnet.wifi_remove({pin!r}, {ssid!r})))')
+
+
+def wifi_connect(port, ssid=None):
+    """Join the best saved network in range (or the saved one named). Returns wifi_status()."""
+    return run(port, "import xnet\n"
+               f"xnet.connect_wifi(ssid={ssid!r}, force=True)\n"
+               'print("XPY:" + json.dumps(xnet.wifi_status()))')
+
+
+def cmd_wifi(args):
+    if args.action == "scan":
+        for n in wifi_scan(args.port):
+            print(f"{n['ssid']:32} {n['rssi']:4} dBm  {n['security']:10} {'saved' if n['saved'] else ''}")
+    elif args.action == "list":
+        print("\n".join(wifi_saved(args.port)) or "No Wi-Fi network saved.")
+    elif args.action == "add":
+        ssid = args.ssid or input("Wi-Fi name (SSID): ")
+        saved = wifi_add(args.port, getpass.getpass("SO PIN: "), ssid, getpass.getpass("Wi-Fi password: "))
+        print("Saved (sealed). Saved networks:", ", ".join(saved))
+    elif args.action == "remove":
+        saved = wifi_remove(args.port, getpass.getpass("SO PIN: "), args.ssid or input("Wi-Fi name (SSID): "))
+        print("Deleted. Saved networks:", ", ".join(saved) or "none")
+    elif args.action == "connect":
+        st = wifi_connect(args.port, args.ssid or None)
+        print(f"Connected to {st['ssid']}, IP {st['ip']}" if st.get("connected") else "Not connected.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="xPython security officer tool")
-    parser.add_argument("--port", default="/dev/ttyUSB0", help="device serial port")
+    parser.add_argument("--port", default=("COM3" if os.name == "nt" else "/dev/ttyUSB0"), help="device serial port")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, fn in [("keygen", cmd_keygen), ("status", cmd_status),
+    for name, fn in [("keygen", cmd_keygen), ("status", cmd_status), ("boardinfo", cmd_boardinfo), ("netca", cmd_netca),
                     ("provision", cmd_provision), ("reset", cmd_reset),
                     ("unlock", cmd_unlock), ("netconfig", cmd_netconfig),
                     ("nettest", cmd_nettest), ("netcert", cmd_netcert),
@@ -399,6 +660,18 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("value", choices=["on", "off"])
         p.set_defaults(fn=fn)
+    p = sub.add_parser("gateway", help="role: off, device (sends via a gateway) or gateway")
+    p.add_argument("value", choices=["off", "device", "gateway"])
+    p.add_argument("--gateway-id", default="", help="device: the gateway board's ID (32 hex)")
+    p.add_argument("--devices", default="", help="gateway: allowed device IDs, comma-separated (empty = all)")
+    p.add_argument("--link", default="espnow", choices=["espnow", "wifi"], help="device: how it reaches the gateway")
+    p.set_defaults(fn=cmd_gateway)
+    p = sub.add_parser("wifi", help="Wi-Fi networks: scan, list, add, remove, connect")
+    p.add_argument("action", choices=["scan", "list", "add", "remove", "connect"])
+    p.add_argument("ssid", nargs="?", default="")
+    p.set_defaults(fn=cmd_wifi)
+    sub.add_parser("gwstatus").set_defaults(fn=cmd_gwstatus)
+    sub.add_parser("gwdevices", help="the devices that joined this gateway").set_defaults(fn=cmd_gwdevices)
     args = parser.parse_args()
     try:
         args.fn(args)

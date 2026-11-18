@@ -1,0 +1,6 @@
+{
+  "app_id": "bench",
+  "version": "1.0.0",
+  "entry": "main.py",
+  "permissions": {"service": "bench", "time_ms": 30000}
+}

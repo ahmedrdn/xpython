@@ -1,5 +1,5 @@
 ; Inno Setup script: makes xpython-setup.exe, the Windows installer for xpython.exe.
-; build_windows.bat runs it after PyInstaller (needs Inno Setup 6: https://jrsoftware.org/isdl.php).
+; build_windows.bat runs it after PyInstaller (which puts xpython.exe in work\dist).
 #define AppName "xPython tools"
 #define AppVersion "1.0.0"
 #define AppExe "xpython.exe"
@@ -12,12 +12,13 @@ AppPublisher=xPython project
 DefaultDirName={autopf}\xPython
 DefaultGroupName=xPython
 UninstallDisplayName={#AppName}
-UninstallDisplayIcon={app}\{#AppExe}
+UninstallDisplayIcon={app}\xpython.ico
 OutputDir=dist
 OutputBaseFilename=xpython-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=icon\xpython.ico
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Installing for "all users" needs administrator rights; the user can choose "just me"
@@ -27,17 +28,18 @@ PrivilegesRequiredOverridesAllowed=dialog
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
-Source: "dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "work\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "icon\xpython.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
 ; The data folder: keys\, server\, apps\, build\ (never removed by the uninstaller)
 Name: "{userdocs}\xPython"; Flags: uninsneveruninstall
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\xpython.ico"
 Name: "{group}\xPython data folder"; Filename: "{userdocs}\xPython"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\xpython.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName} now"; Flags: nowait postinstall skipifsilent

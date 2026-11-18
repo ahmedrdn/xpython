@@ -1,0 +1,6 @@
+{
+  "app_id": "rgb_c61",
+  "version": "1.0.1",
+  "entry": "main.py",
+  "permissions": {"time_ms": 5000}
+}

@@ -4,30 +4,162 @@
     {
       "label": "PC: build + test",
       "type": "shell",
-      "command": "make -C micropython/ports/unix USER_C_MODULES=$HOME/xpython/modules && for t in tests/test_*.py; do MICROPYPATH=$HOME/xpython/modules/xfw:$HOME/xpython/modules/xsfs:$HOME/xpython/modules/xloader:$HOME/xpython/modules/xexec:$HOME/xpython/modules/xnet:$HOME/xpython/modules/xota:$HOME/xpython/modules/xmsg:.frozen micropython/ports/unix/build-standard/micropython $t || exit 1; done",
-      "options": { "cwd": "${workspaceFolder}" },
-      "group": { "kind": "build", "isDefault": true },
-      "problemMatcher": ["$gcc"]
+      "command": "make -C micropython/ports/unix USER_C_MODULES=$HOME/xpython/modules && for t in tests/test_*.py; do MICROPYPATH=$HOME/xpython/modules/xfota:$HOME/xpython/modules/xsfs:$HOME/xpython/modules/xloader:$HOME/xpython/modules/xexec:$HOME/xpython/modules/xcomm:.frozen micropython/ports/unix/build-standard/micropython $t || exit 1; done",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
     },
     {
       "label": "ESP32: build + flash",
       "type": "shell",
       "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyUSB0 deploy",
-      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
-      "problemMatcher": ["$gcc"]
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
     },
     {
       "label": "ESP32: run tests",
       "type": "shell",
-      "command": "for t in tests/test_*.py; do mpremote connect /dev/ttyUSB0 run $t || exit 1; done",      "options": { "cwd": "${workspaceFolder}" },
+      "command": "for t in tests/test_*.py; do mpremote connect /dev/ttyUSB0 run $t || exit 1; done",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": []
     },
     {
       "label": "ESP32: build",
       "type": "shell",
       "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake",
-      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
-      "problemMatcher": ["$gcc"]
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "ESP32-C6: build",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32C6 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32C6 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "ESP32-S3: build",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32S3 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32S3 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "ESP32-S3: build + flash",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32S3 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32S3 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyACM0 deploy",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "ESP32-C6: build + flash",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32C6 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32C6 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyACM0 deploy",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "ESP32-C3: build",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32C3 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32C3 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "ESP32-C3: build + flash",
+      "type": "shell",
+      "command": "source esp-idf/export.sh > /dev/null && make -C micropython/ports/esp32 BOARD=XPY_ESP32C3 BOARD_DIR=$HOME/xpython/boards/XPY_ESP32C3 USER_C_MODULES=$HOME/xpython/modules/micropython.cmake PORT=/dev/ttyACM0 deploy",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/bin/bash",
+          "args": [
+            "-c"
+          ]
+        }
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
     }
   ]
 }

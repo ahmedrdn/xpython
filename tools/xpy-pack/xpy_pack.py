@@ -11,6 +11,7 @@ and its .py files.
 import argparse
 import hashlib
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -21,8 +22,13 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-ROOT = Path(__file__).resolve().parents[2]
-MPY_CROSS = ROOT / "micropython/mpy-cross/build/mpy-cross"
+# The xPython folder (keys/, server/, apps/, build/ ...). XPY_ROOT is set by the packed
+# Windows app (xpython.exe), whose data folder is the folder of the .exe.
+ROOT = Path(os.environ.get("XPY_ROOT") or Path(__file__).resolve().parents[2])
+# How to run mpremote: the command, or (packed app) the .exe itself with --mpremote
+MPREMOTE = json.loads(os.environ.get("XPY_MPREMOTE", '["mpremote"]'))
+TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}     # same on Windows and Linux
+MPY_CROSS = ROOT / "micropython/mpy-cross/build/mpy-cross"   # compiles .py to .mpy (optional)
 APP_KEY = ROOT / "keys/app_sign.pem"
 MAGIC = b"XPK1"
 SIG_LABEL = b"xpy-app-v1"
@@ -34,7 +40,7 @@ def sign_raw(priv, data):
 
 
 def mpremote(port, *args):
-    p = subprocess.run(["mpremote", "connect", port, *args], capture_output=True, text=True)
+    p = subprocess.run([*MPREMOTE, "connect", port, *args], capture_output=True, **TEXT)
     print((p.stdout + p.stderr).strip())
     if p.returncode != 0:
         sys.exit("Device error.")
@@ -44,6 +50,9 @@ def cmd_build(args):
     app_dir = Path(args.app_dir)
     meta = json.loads((app_dir / "app.json").read_text())
     files = {}
+    if not args.no_compile and not MPY_CROSS.exists():
+        print(f"(no mpy-cross at {MPY_CROSS}: the app is sent as .py source)")
+        args.no_compile = True
     for src in sorted(app_dir.glob("*.py")):
         if args.no_compile:
             files[src.name] = src.read_bytes()
@@ -98,7 +107,7 @@ def cmd_run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="xPython app packer")
-    parser.add_argument("--port", default="/dev/ttyUSB0")
+    parser.add_argument("--port", default=("COM3" if os.name == "nt" else "/dev/ttyUSB0"))
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build")
     b.add_argument("app_dir")

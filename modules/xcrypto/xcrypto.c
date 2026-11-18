@@ -5,9 +5,10 @@
 #include "mbedtls/md.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/ecdsa.h"
+#include "mbedtls/ecdh.h"
 #include "xcrypto.h"
 
-#define XCRYPTO_VERSION "1.1.0"
+#define XCRYPTO_VERSION "1.2.0"
 
 // ---------- Platform: random source + hardware info ----------
 // ---------- Random source: different for each platform ----------
@@ -377,6 +378,53 @@ static mp_obj_t xcrypto_ecdsa_verify(mp_obj_t pub_in, mp_obj_t data_in, mp_obj_t
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(xcrypto_ecdsa_verify_obj, xcrypto_ecdsa_verify);
 
+// ---------- ecdh(private, peer_public) -> 32-byte shared secret, curve P-256 ----------
+// Both sides get the same secret: ecdh(my_private, your_public) == ecdh(your_private, my_public).
+// Used with keys from ecdsa_keygen() made fresh for each session (ephemeral keys).
+static mp_obj_t xcrypto_ecdh(mp_obj_t priv_in, mp_obj_t pub_in) {
+    mp_buffer_info_t priv, pub;
+    mp_get_buffer_raise(priv_in, &priv, MP_BUFFER_READ);
+    mp_get_buffer_raise(pub_in, &pub, MP_BUFFER_READ);
+    if (priv.len != 32 || pub.len != 65) {
+        mp_raise_ValueError(MP_ERROR_TEXT("need a 32-byte private and a 65-byte public key"));
+    }
+    mbedtls_ecp_group grp;
+    mbedtls_mpi d, z;
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_mpi_init(&d);
+    mbedtls_mpi_init(&z);
+    mbedtls_ecp_point_init(&Q);
+    uint8_t secret[32];
+    int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    if (ret == 0) {
+        ret = mbedtls_mpi_read_binary(&d, priv.buf, 32);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecp_point_read_binary(&grp, &Q, pub.buf, 65);
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecp_check_pubkey(&grp, &Q);    // reject points not on the curve
+    }
+    if (ret == 0) {
+        ret = mbedtls_ecdh_compute_shared(&grp, &z, &Q, &d, xc_rng, NULL);
+    }
+    if (ret == 0) {
+        ret = mbedtls_mpi_write_binary(&z, secret, sizeof(secret));
+    }
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_mpi_free(&z);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_group_free(&grp);
+    if (ret != 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("ecdh failed"));
+    }
+    mp_obj_t out = mp_obj_new_bytes(secret, sizeof(secret));
+    memset(secret, 0, sizeof(secret));
+    return out;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(xcrypto_ecdh_obj, xcrypto_ecdh);
+
 // ---------- capabilities() -> dict describing this build ----------
 static mp_obj_t xcrypto_capabilities(void) {
     mp_obj_t algos[] = {
@@ -385,6 +433,7 @@ static mp_obj_t xcrypto_capabilities(void) {
         MP_OBJ_NEW_QSTR(MP_QSTR_hkdf_sha256),
         MP_OBJ_NEW_QSTR(MP_QSTR_aes_gcm),
         MP_OBJ_NEW_QSTR(MP_QSTR_ecdsa_p256),
+        MP_OBJ_NEW_QSTR(MP_QSTR_ecdh_p256),
         MP_OBJ_NEW_QSTR(MP_QSTR_random),
     };
     mp_obj_t d = mp_obj_new_dict(6);
@@ -447,6 +496,7 @@ static const mp_rom_map_elem_t xcrypto_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_ecdsa_keygen),  MP_ROM_PTR(&xcrypto_ecdsa_keygen_obj) },
     { MP_ROM_QSTR(MP_QSTR_ecdsa_sign),    MP_ROM_PTR(&xcrypto_ecdsa_sign_obj) },
     { MP_ROM_QSTR(MP_QSTR_ecdsa_verify),  MP_ROM_PTR(&xcrypto_ecdsa_verify_obj) },
+    { MP_ROM_QSTR(MP_QSTR_ecdh),          MP_ROM_PTR(&xcrypto_ecdh_obj) },
     { MP_ROM_QSTR(MP_QSTR_capabilities), MP_ROM_PTR(&xcrypto_capabilities_obj) },
     { MP_ROM_QSTR(MP_QSTR_selftest),        MP_ROM_PTR(&xcrypto_selftest_obj) },
 };

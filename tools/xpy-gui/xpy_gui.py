@@ -5,8 +5,8 @@ It runs the SAME code as the command-line tools: every button calls one of their
 commands and answers its questions from the fields in the window.
 Start it from the repo:   python3 tools/xpy-gui/xpy_gui.py
 Needs Tkinter:            sudo apt install python3-tk
-Packed for Windows:       xpython.exe (see tools/xpy-gui/build_windows.bat); its data
-                          folder (keys/, server/, apps/, build/) is the folder of the .exe.
+Windows installer:        tools/xpy-gui/build_windows.bat makes dist/xpython-setup.exe;
+                          the installed program keeps its data in Documents/xPython.
 """
 import argparse
 import builtins
@@ -17,6 +17,8 @@ import importlib.util
 import json
 import os
 import queue
+import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -29,17 +31,32 @@ HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))   # w
 
 def _data_folder():
     """The xPython data folder (keys/, server/, apps/, build/ ...).
-    From the repo: ~/xpython. Installed xpython.exe: Documents/xPython (Program Files is not
-    writable). Portable xpython.exe: its own folder, if a file named "portable" is next to it.
-    XPY_DATA overrides all of these."""
+    From the repo: ~/xpython. Installed xPython tools (Windows): Documents/xPython.
+    XPY_DATA overrides both."""
     if os.environ.get("XPY_DATA"):
         return Path(os.environ["XPY_DATA"])
     if not FROZEN:
         return Path(__file__).resolve().parents[2]
-    exe_dir = Path(sys.executable).resolve().parent
-    if (exe_dir / "portable").exists():
-        return exe_dir
-    return Path.home() / "Documents" / "xPython"
+    return _documents() / "xPython"
+
+
+def _documents():
+    """The user's real Documents folder. On Windows it is asked from Windows itself, because
+    OneDrive often moves it (e.g. C:\\Users\\me\\OneDrive\\Documents); the installer uses the same."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            # FOLDERID_Documents {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+            guid = (ctypes.c_ubyte * 16)(*bytes.fromhex("d09ad3fd8f23af46adb46c85480369c7"))
+            out = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(out)) == 0:
+                path = out.value
+                ctypes.windll.ole32.CoTaskMemFree(out)
+                return Path(path)
+        except (OSError, AttributeError):
+            pass
+    return Path.home() / "Documents"
 
 
 ROOT = _data_folder()
@@ -104,14 +121,35 @@ ota = _load_tool("xpy_ota", "tools/xpy-ota/xpy_ota.py")
 
 
 BUILD = ROOT / "micropython/ports/esp32/build-XPY_ESP32"      # where "ESP32: build" puts its files
+# The boards xPython is built for: esptool's chip name and where the bootloader goes
+BOARDS = {"XPY_ESP32": ("esp32", 0x1000), "XPY_ESP32C6": ("esp32c6", 0x0),
+          "XPY_ESP32S3": ("esp32s3", 0x0), "XPY_ESP32C3": ("esp32c3", 0x0)}
+CHIP_IDS = {0: "XPY_ESP32", 13: "XPY_ESP32C6", 9: "XPY_ESP32S3", 5: "XPY_ESP32C3"}                  # byte 12-13 of an ESP app image
+
+
+def board_of(image):
+    """Which xPython board an app image is for: its version label, else its chip ID."""
+    tag = ota.firmware_tag(image)
+    board = tag[0] if tag else CHIP_IDS.get(image[12] | image[13] << 8 if len(image) > 13 else -1)
+    if board not in BOARDS:
+        raise ValueError("firmware for an unknown board: " + str(board))
+    chip = CHIP_IDS.get(image[12] | image[13] << 8)
+    if chip and chip != board:
+        raise ValueError(f"its label says {board} but the image is for {chip}")
+    return board
+
+
+def build_dir(board):
+    return ROOT / "micropython/ports/esp32" / ("build-" + board)
 APP_ADDR, APP_SLOT = 0x10000, 0x1D0000                          # ota_0 in partitions-xpy-ota.csv
 OTADATA = (0xD000, 0x2000)                                      # which slot boots
 
 
 def check_firmware(path):
-    """Check a firmware file before flashing. Returns (image file to flash, description).
+    """Check a firmware file before flashing.
     .xfw (signed OTA package): signature (keys/fw_sign.pem), hash and board are verified.
-    .bin (plain image): only that it is an ESP32 app with xPython inside, that fits the slot."""
+    .bin (plain image): only that it is an ESP32 app with xPython inside, that fits the slot.
+    Returns (image file to flash, description, board name)."""
     import hashlib, json, struct
     data = Path(path).read_bytes()
     if data[:4] == b"XFW1":
@@ -131,8 +169,8 @@ def check_firmware(path):
         h = json.loads(header)
         if hashlib.sha256(image).hexdigest() != h["sha256"] or len(image) != h["size"]:
             raise ValueError("the firmware inside the package was changed after signing")
-        if h.get("board") != "XPY_ESP32":
-            raise ValueError("firmware for another board: " + str(h.get("board")))
+        if h.get("board") not in BOARDS:
+            raise ValueError("firmware for an unknown board: " + str(h.get("board")))
         out = ROOT / "build" / "ota" / "_flash_image.bin"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(image)
@@ -145,11 +183,47 @@ def check_firmware(path):
         raise ValueError("this is not an xPython firmware")
     if len(image) > APP_SLOT:
         raise ValueError(f"too big for the firmware slot ({len(image)} > {APP_SLOT} bytes)")
-    return out, desc
+    board = board_of(image)
+    return out, f"{desc}\nBoard: {board} (chip {BOARDS[board][0]})", board
 
 
 # Standard secure port of each protocol (filled in when the protocol is chosen).
 DEFAULT_PORTS = {"mqtt": "8883", "http": "443", "coap": "5684"}
+
+# Platform presets: they only fill the fields (all stay editable); replace the <...> parts.
+#   {device} {app} {sub} {key} in a topic or path are filled in by the board (xnet).
+PRESETS = {
+    "ThingSpeak (MQTT)": {"protocol": "mqtt", "host": "mqtt3.thingspeak.com", "port": "8883",
+                          "topic": "channels/<channel ID>/publish", "fields": "temperature,humidity",
+                          "header": "", "name": "ts_mqtt"},
+    "ThingSpeak (HTTP)": {"protocol": "http", "host": "api.thingspeak.com", "port": "443",
+                          "topic": "/update", "fields": "temperature,humidity",
+                          "header": "THINGSPEAKAPIKEY: {key}", "name": "ts_http"},
+    "ThingsBoard (MQTT)": {"protocol": "mqtt", "host": "mqtt.thingsboard.cloud", "port": "8883",
+                           "topic": "v1/devices/me/telemetry", "fields": "", "header": "", "name": "tb_mqtt"},
+    "ThingsBoard (HTTP)": {"protocol": "http", "host": "thingsboard.cloud", "port": "443",
+                           "topic": "/api/v1/{key}/telemetry", "fields": "", "header": "", "name": "tb_http"},
+    "ThingsBoard (CoAP)": {"protocol": "coap", "host": "thingsboard.cloud", "port": "5684",
+                           "topic": "api/v1/{key}/telemetry", "fields": "", "header": "", "name": "tb_coap"},
+    "HiveMQ Cloud (MQTT)": {"protocol": "mqtt", "host": "<cluster>.s1.eu.hivemq.cloud", "port": "8883",
+                            "topic": "xpy/{device}/{app}/{sub}", "fields": "", "header": "", "name": "hivemq"},
+    # the "updates" service is only listened to: fw_update (ThingSpeak field1) changed = check firmware,
+    # app_update (field2) changed = check apps
+    "Updates: ThingsBoard (MQTT)": {"protocol": "mqtt", "host": "mqtt.thingsboard.cloud", "port": "8883",
+                                    "topic": "v1/devices/me/attributes", "fields": "", "header": "", "name": "updates"},
+    "Updates: ThingsBoard (HTTP)": {"protocol": "http", "host": "thingsboard.cloud", "port": "443",
+                                    "topic": "/api/v1/{key}/attributes?sharedKeys=fw_update,app_update", "fields": "",
+                                    "header": "", "name": "updates"},
+    "Updates: ThingSpeak (HTTP)": {"protocol": "http", "host": "api.thingspeak.com", "port": "443",
+                                   "topic": "/channels/<channel ID>/feeds/last.json?api_key={key}", "fields": "",
+                                   "header": "", "name": "updates"},
+    "Custom MQTT": {"protocol": "mqtt", "host": "", "port": "8883",
+                    "topic": "xpy/{device}/{app}/{sub}", "fields": "", "header": "", "name": "default"},
+    "Custom HTTP": {"protocol": "http", "host": "", "port": "443",
+                    "topic": "/api/{device}/{sub}", "fields": "", "header": "Authorization: Bearer {key}", "name": "default"},
+    "Custom CoAP": {"protocol": "coap", "host": "", "port": "5684",
+                    "topic": "{device}/{sub}", "fields": "", "header": "", "name": "default"},
+}
 
 
 class _LogWriter:
@@ -169,6 +243,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("xPython tools  —  data folder: " + str(ROOT))
+        icon = HERE / "tools" / "xpy-gui" / "icon" / "xpython.png"    # window and taskbar icon
+        if icon.exists():
+            self._icon = tk.PhotoImage(file=str(icon))
+            self.iconphoto(True, self._icon)
         self.geometry("920x800")
         self.minsize(760, 560)
         self.q = queue.Queue()
@@ -184,7 +262,7 @@ class App(tk.Tk):
 
     # ---------------- layout ----------------
     def _build(self):
-        style = ttk.Style(self)
+        style = ttk.Style()
         if "clam" in style.theme_names():
             style.theme_use("clam")
         style.configure("Head.TLabel", font=("TkDefaultFont", 10, "bold"))
@@ -200,22 +278,43 @@ class App(tk.Tk):
         self.pin = ttk.Entry(top, width=12, show="•")
         self.pin.pack(side="left", padx=4)
         ttk.Button(top, text="Status", command=self.do_status).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Board info", command=lambda: self.run_cmd(officer.cmd_boardinfo)).pack(side="left", padx=(4, 0))
         ttk.Button(top, text="Data folder", command=self.open_data_folder).pack(side="right")
         self.state_lbl = ttk.Label(top, text="", style="Head.TLabel")
         self.state_lbl.pack(side="left", padx=10)
 
+        self.out_btn = ttk.Button(top, text="Hide output", command=self.toggle_output)
+        self.out_btn.pack(side="right", padx=(0, 6))
+        self._canvases = []
         pw = ttk.PanedWindow(self, orient="vertical")
         pw.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         nb = ttk.Notebook(pw)
         pw.add(nb, weight=3)
+        self._pages = []
         for title, builder in (("Device", self._tab_device), ("Network", self._tab_network),
                                ("Apps", self._tab_apps), ("Firmware", self._tab_firmware)):
-            outer, f = self._scrollable(nb)
-            nb.add(outer, text=title)
+            page = ttk.Frame(nb)
+            nb.add(page, text=title)
+            # left: the tab's section names (like Office's Options window); right: one section
+            nav = tk.Listbox(page, width=24, activestyle="none", exportselection=False, borderwidth=0,
+                             highlightthickness=0, font=("TkDefaultFont", 11),
+                             background=style.lookup("TFrame", "background"),
+                             selectbackground="#cfe0f5", selectforeground="#000000")
+            nav.pack(side="left", fill="y", padx=(6, 0), pady=8)
+            ttk.Separator(page, orient="vertical").pack(side="left", fill="y", padx=(6, 0), pady=8)
+            outer, f = self._scrollable(page)
+            outer.pack(side="left", fill="both", expand=True)
+            self._page = {"nav": nav, "sections": [], "canvas": self._canvases[-1][0]}
+            self._pages.append(self._page)
             builder(f)
+            nav.bind("<<ListboxSelect>>", lambda e, pg=self._page: self._show_section(pg))
+            self._show_section(self._page, 0)
+        nb.bind("<<NotebookTabChanged>>",           # opening a tab shows its first section
+                lambda e: self._show_section(self._pages[nb.index("current")], 0))
 
         logf = ttk.Frame(pw)
         pw.add(logf, weight=2)
+        self.pw, self.logf, self.log_shown = pw, logf, True
         bar = ttk.Frame(logf)
         bar.pack(fill="x")
         ttk.Label(bar, text="Output", style="Head.TLabel").pack(side="left")
@@ -226,11 +325,22 @@ class App(tk.Tk):
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.log.pack(fill="both", expand=True)
+        for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(ev, self._wheel)
+
+    def toggle_output(self):
+        """Hide or show the output pane (the tabs then use the whole window)."""
+        if self.log_shown:
+            self.pw.forget(self.logf)
+        else:
+            self.pw.add(self.logf, weight=2)
+        self.log_shown = not self.log_shown
+        self.out_btn.configure(text="Hide output" if self.log_shown else "Show output")
 
     def _scrollable(self, parent):
         """A tab whose content scrolls when the window is too small for it."""
         outer = ttk.Frame(parent)
-        canvas = tk.Canvas(outer, highlightthickness=0, background=ttk.Style(self).lookup("TFrame", "background"))
+        canvas = tk.Canvas(outer, highlightthickness=0, background=ttk.Style().lookup("TFrame", "background"))
         bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas, padding=12)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -240,18 +350,46 @@ class App(tk.Tk):
         bar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        def wheel(e):
-            if inner.winfo_height() > canvas.winfo_height():
-                canvas.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
-        for w in (canvas, inner):
-            w.bind("<Enter>", lambda e: (self.bind_all("<Button-4>", wheel), self.bind_all("<Button-5>", wheel),
-                                         self.bind_all("<MouseWheel>", wheel)))
+        self._canvases.append((canvas, inner))
         return outer, inner
 
-    def _section(self, parent, title):
+    def _wheel(self, e):
+        """Mouse wheel: scroll only the tab under the pointer. Lists, the output and drop-down
+        boxes scroll themselves, so the tab behind them stays still."""
+        w = e.widget
+        if not hasattr(w, "winfo_class") or w.winfo_class() in ("Text", "Listbox", "TCombobox", "Treeview"):
+            return
+        path = str(w)
+        for canvas, inner in self._canvases:
+            if path == str(canvas) or path.startswith(str(canvas) + "."):
+                if canvas.winfo_ismapped() and inner.winfo_height() > canvas.winfo_height():
+                    canvas.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
+                return
+
+    def _section(self, parent, title, nav=None):
+        """One section of the current tab: its name goes into the tab's list on the left
+        (nav, or the title up to ':' or '('), and it is shown when that name is clicked."""
         f = ttk.LabelFrame(parent, text=title, padding=10)
-        f.pack(fill="x", pady=(0, 10))
+        name = nav or title.split(":")[0].split("(")[0].strip()
+        self._page["sections"].append(f)
+        self._page["nav"].insert("end", "  " + name)
         return f
+
+    def _show_section(self, page, index=None):
+        nav = page["nav"]
+        if index is None:
+            sel = nav.curselection()
+            if not sel:
+                return
+            index = sel[0]
+        nav.selection_clear(0, "end")
+        nav.selection_set(index)
+        for i, f in enumerate(page["sections"]):
+            if i == index:
+                f.pack(fill="x", pady=(0, 10))
+            else:
+                f.pack_forget()
+        page["canvas"].yview_moveto(0)
 
     def _row(self, parent, label, width=34, show=None, browse=None, default=""):
         r = ttk.Frame(parent)
@@ -286,40 +424,178 @@ class App(tk.Tk):
 
     def _tab_device(self, f):
         s = self._section(f, "Set up a new board")
-        ttk.Label(s, text="Keys are created once on this PC (kept in keys/). Provision needs a BLANK board;\n"
-                          "on a board without a PIN, the PIN in the top bar becomes its new SO PIN.").pack(anchor="w")
+        ttk.Label(s, text="Provision a BLANK board: the PIN in the top bar becomes its SO PIN; it also gets its TLS certificate.").pack(anchor="w")
         self._buttons(s, ("Create organization keys", lambda: self.run_cmd(officer.cmd_keygen)),
                       ("Provision", lambda: self.run_cmd(officer.cmd_provision, pin=True)),
+                      ("Renew TLS certificate", lambda: self.run_cmd(officer.cmd_netcert, pin=True)),
                       ("Reset to BLANK…", self.do_reset))
         s = self._section(f, "Lock / unlock")
-        ttk.Label(s, text="Lock: the board runs its apps by itself and the REPL is closed (dev mode off, restart).\n"
-                          "Unlock: opens the REPL for setting up and testing (sends the PIN in the 3-second\n"
-                          "window after a restart; if nothing happens, press the board's EN button).").pack(anchor="w")
+        ttk.Label(s, text="Lock: apps run by themselves, REPL closed.  Unlock: REPL open for setup (press EN if nothing happens).").pack(anchor="w")
         self._buttons(s, ("Lock", self.do_lock),
                       ("Unlock", lambda: self.run_cmd(officer.cmd_unlock, pin=True)))
         s = self._section(f, "Monitor")
-        ttk.Label(s, text="Shows what the board prints, also when it is locked. Other buttons stop it first,\n"
-                          "because they need the USB port.").pack(anchor="w")
+        ttk.Label(s, text="Shows what the board prints, even when locked.").pack(anchor="w")
         self._buttons(s, ("Start monitor", self.do_monitor), ("Stop monitor", self.stop_monitor),
                       ("Restart board", lambda: self.do_monitor(reset=True)))
 
     def _tab_network(self, f):
         self._tab_wifi(f)
         self._tab_cloud(f)
+        self._tab_gateway(f)
+        self._tab_server(f)
+
+    def _tab_server(self, f):
+        s = self._section(f, "Server: firmware and app updates over the air (HTTPS with mutual TLS, port 8443)",
+                          nav="Update server")
+        ttk.Label(s, text="Serves one firmware per board type (build/ota/firmware) and the apps in build/ota/apps\n"
+                          "to the boards over mutual TLS. Each board fetches only the firmware of its own type.\n"
+                          "Publish puts a new version there (no restart needed); then announce it in ThingsBoard:\n"
+                          "fw_update = check firmware only, app_update = check apps only (or wait for the hourly check).").pack(anchor="w")
+        self._buttons(s, ("Publish firmware…", self.do_publish_fw), ("Publish app…", self.do_publish_app))
+        ttk.Label(s, text="Published now (what the boards can fetch):").pack(anchor="w", pady=(8, 0))
+        self.pub_list = ttk.Treeview(s, columns=("kind", "name", "version", "file"), show="headings",
+                                     height=5, selectmode="browse")
+        for col, text, w in (("kind", "Kind", 80), ("name", "Name", 140), ("version", "Version", 80),
+                             ("file", "File", 320)):
+            self.pub_list.heading(col, text=text)
+            self.pub_list.column(col, width=w, stretch=(col == "file"))
+        self.pub_list.pack(fill="x")
+        self._buttons(s, ("Refresh", self.do_show_published), ("Remove selected…", self.do_unpublish))
+        self.refresh_published()
+        self._buttons(s, ("Create server certificates (once)", lambda: self.run_cmd(officer.cmd_netca)))
+        r = ttk.Frame(s)
+        r.pack(fill="x", pady=(6, 0))
+        ttk.Button(r, text="Start server", command=self.do_serve).pack(side="left", padx=(0, 6))
+        ttk.Button(r, text="Stop server", command=self.do_stop_serve).pack(side="left", padx=(0, 6))
+        ttk.Label(r, text="Server:").pack(side="left", padx=(6, 2))
+        self.srv_lbl = ttk.Label(r, text="stopped", style="Head.TLabel")
+        self.srv_lbl.pack(side="left")
+        self._buttons(s, ("Push update", lambda: self.run_cmd(ota.cmd_push, ota_port=8443)))
+        # several boards at once
+        ttk.Label(s, text="Select USB boards (Ctrl/Shift + click) and push. Wi-Fi boards also check the server every hour;\nESP-NOW devices are updated over USB.").pack(anchor="w", pady=(8, 2))
+        r = ttk.Frame(s)
+        r.pack(fill="x")
+        self.push_list = tk.Listbox(r, selectmode="extended", height=4, width=24, exportselection=False)
+        self.push_list.pack(side="left")
+        col = ttk.Frame(r)
+        col.pack(side="left", padx=6, anchor="n")
+        ttk.Button(col, text="↻ Find boards", command=self.refresh_push_list).pack(fill="x")
+        ttk.Button(col, text="Select all", command=lambda: self.push_list.select_set(0, "end")).pack(fill="x", pady=2)
+        ttk.Button(col, text="Push to selected boards", command=self.do_push_many).pack(fill="x")
+        self.refresh_push_list()
+
+    def _tab_gateway(self, f):
+        s = self._section(f, "Role: off · device (sends through a gateway) · gateway (forwards for its devices)",
+                          nav="Gateway / role")
+        ttk.Label(s, text="Gateway: role gateway, Save, then 'Copy this board's ID'.  Device: role device + that ID, Save.").pack(anchor="w")
+        r = ttk.Frame(s)
+        r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Role", width=22).pack(side="left")
+        self.gw_role = ttk.Combobox(r, width=10, state="readonly", values=["off", "device", "gateway"])
+        self.gw_role.set("device")
+        self.gw_role.pack(side="left")
+        r = ttk.Frame(s)
+        r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Link (device)", width=22).pack(side="left")
+        self.gw_link = ttk.Combobox(r, width=10, state="readonly", values=["espnow", "wifi"])
+        self.gw_link.set("espnow")
+        self.gw_link.pack(side="left")
+        ttk.Label(r, text="  espnow: no router · wifi: via the gateway's Wi-Fi").pack(side="left")
+        self.gw_id = self._row(s, "Gateway ID (device)")
+        self.gw_devs = self._row(s, "Allowed devices (gateway)")
+        ttk.Label(s, text="Allowed devices: optional IDs, comma-separated; empty = all your boards.").pack(anchor="w")
+        self._buttons(s, ("Save role", self.do_gateway), ("Copy this board's ID", self.do_gw_copy_id),
+                      ("Show role", lambda: self.run_cmd(officer.cmd_gwstatus)))
+        ttk.Label(s, text="Devices that joined this gateway (connect the GATEWAY board):").pack(anchor="w", pady=(8, 2))
+        r = ttk.Frame(s)
+        r.pack(fill="x")
+        self.dev_list = tk.Listbox(r, height=5, exportselection=False, font=("Courier", 9))
+        self.dev_list.pack(side="left", fill="x", expand=True)
+        col = ttk.Frame(r)
+        col.pack(side="left", padx=6, anchor="n")
+        ttk.Button(col, text="↻ Refresh", command=self.do_list_devices).pack(fill="x")
+        ttk.Button(col, text="Clear list…", command=self.do_forget_devices).pack(fill="x", pady=2)
+
+    def do_list_devices(self):
+        port = self.port.get()
+
+        def work():
+            d = officer.run(port, 'import xgate\nprint("XPY:" + json.dumps(xgate.devices()))')
+            rows = sorted(d.items(), key=lambda kv: kv[1].get("last", ""), reverse=True)
+            lines = [f"{k}  {v['link']:6}  {v['address']:21}  last {v['last']}  ({v['joins']}×)" for k, v in rows]
+            self.q.put(("devices", lines or ["(no device has joined this gateway yet)"]))
+            self._say(f"{len(lines)} device(s) joined this gateway.")
+        self._say("\n▶ gateway devices")
+        self.answers = {}
+        self._start(work)
+
+    def do_forget_devices(self):
+        if self._need_pin() and messagebox.askyesno("Clear list", "Clear the gateway's list of devices?\n"
+                                                    "(The devices themselves are not affected.)"):
+            pin = self.pin.get()
+            self.run_code(f'import xgate\nxgate.forget_devices({pin!r})\nprint("XPY:1")',
+                          lambda r: "Device list cleared.")
+            self.after(2500, self.do_list_devices)
+
+    def do_gateway(self):
+        self.run_cmd(officer.cmd_gateway, pin=True, value=self.gw_role.get(),
+                     gateway_id=self.gw_id.get().strip(), devices=self.gw_devs.get().strip(),
+                     link=self.gw_link.get())
+
+    def do_gw_copy_id(self):
+        port = self.port.get()
+
+        def work():
+            r = officer.run(port, 'd = xinit.device_id()\nprint("XPY:" + json.dumps(d.hex() if d else None))')
+            if not r:
+                self._say("This board has no ID yet: provision it first.")
+                return
+            self.q.put(("gw_id", r))
+            self._say(f"Gateway ID copied: {r}\nNow connect a device board and save its role 'device'.")
+        self._start(work)
 
     def _tab_wifi(self, f):
-        s = self._section(f, "Wi-Fi")
+        s = self._section(f, "Wi-Fi: several networks, saved sealed on the board; it joins the strongest saved one")
+        ttk.Label(s, text="Scan shows what the board sees. Select a network, type its password, Save + connect.\n"
+                          "If no saved network is in range, the board keeps its apps running and tries again every minute.").pack(anchor="w")
+        r = ttk.Frame(s)
+        r.pack(fill="x", pady=(6, 0))
+        left = ttk.Frame(r)
+        left.pack(side="left", fill="x", expand=True)
+        ttk.Label(left, text="Networks in range").pack(anchor="w")
+        self.scan_list = ttk.Treeview(left, columns=("ssid", "signal", "security", "saved"), show="headings",
+                                      height=6, selectmode="browse")
+        for col, text, w in (("ssid", "Name", 220), ("signal", "Signal", 80), ("security", "Security", 100),
+                             ("saved", "Saved", 60)):
+            self.scan_list.heading(col, text=text)
+            self.scan_list.column(col, width=w, stretch=(col == "ssid"))
+        self.scan_list.pack(fill="x")
+        self.scan_list.bind("<<TreeviewSelect>>", self._wifi_picked)
+        right = ttk.Frame(r)
+        right.pack(side="left", fill="y", padx=(12, 0))
+        ttk.Label(right, text="Saved networks").pack(anchor="w")
+        self.saved_list = tk.Listbox(right, height=7, width=26, exportselection=False)
+        self.saved_list.pack(fill="y")
+        self._buttons(s, ("Scan", self.do_wifi_scan), ("Connect to best saved", self.do_wifi_connect),
+                      ("Show saved", self.do_wifi_saved), ("Delete selected saved…", self.do_wifi_remove))
         self.ssid = self._row(s, "Wi-Fi name")
         self.wpass = self._row(s, "Wi-Fi password", show="•")
+        self._buttons(s, ("Save + connect", self.do_wifi))
         self.broker = self._row(s, "Local broker IP (optional)")
-        self._buttons(s, ("Save Wi-Fi", self.do_wifi))
+        self._buttons(s, ("Save broker IP", self.do_broker))
         s = self._section(f, "Local broker (mutual TLS, also used for firmware updates)")
-        self._buttons(s, ("Issue device TLS certificate", lambda: self.run_cmd(officer.cmd_netcert, pin=True)),
-                      ("Test local broker", lambda: self.run_cmd(officer.cmd_nettest)),
+        self._buttons(s, ("Test local broker", lambda: self.run_cmd(officer.cmd_nettest)),
                       ("Send app data here, not to the cloud", self.do_clear_cloud))
 
     def _tab_cloud(self, f):
         s = self._section(f, "Cloud services: where app data goes (the server's certificate is always checked)")
+        r = ttk.Frame(s)
+        r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Platform", width=22).pack(side="left")
+        self.preset = ttk.Combobox(r, width=28, state="readonly", values=list(PRESETS))
+        self.preset.pack(side="left")
+        self.preset.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
+        ttk.Label(r, text="  fills the fields; replace the <...> parts").pack(side="left")
         r = ttk.Frame(s)
         r.pack(fill="x", pady=2)
         ttk.Label(r, text="Protocol", width=22).pack(side="left")
@@ -344,13 +620,41 @@ class App(tk.Tk):
         self.btn_box = self._buttons(s, ("Load credentials file…", self.do_load_creds),
                                      ("Find CA for host", self.do_find_ca))
         self._buttons(s, ("Save", self.do_cloud), ("Send test message", self.do_cloud_test),
-                      ("Delete service", self.do_delete_service),
-                      ("Show saved services", lambda: self.run_code(
-                          'import xnet\nc = xnet.config()\nd = dict(c.get("services", {}))\n'
-                          'd["default"] = c.get("cloud")\nprint("XPY:" + json.dumps(d))',
-                          lambda r: "\n".join(f"{n}: {v['protocol'].upper()} {v['host']}:{v['port']} {v['topic']}"
-                                              if v else f"{n}: (none)" for n, v in r.items()))))
+                      ("Delete service", self.do_delete_service))
+        ttk.Label(s, text="Saved on the board (click one to put its name in 'Service name'):").pack(anchor="w", pady=(8, 2))
+        r = ttk.Frame(s)
+        r.pack(fill="x")
+        self.svc_list = tk.Listbox(r, height=4, exportselection=False)
+        self.svc_list.pack(side="left", fill="x", expand=True)
+        self.svc_list.bind("<<ListboxSelect>>", self._service_picked)
+        ttk.Button(r, text="↻ Refresh", command=self.do_list_services).pack(side="left", padx=6, anchor="n")
         self._show_protocol()
+
+    SERVICES_CODE = ('import xnet\nc = xnet.config()\nd = dict(c.get("services", {}))\n'
+                     'd["default"] = c.get("cloud")\nprint("XPY:" + json.dumps(d))')
+
+    def _service_lines(self, port):
+        d = officer.run(port, self.SERVICES_CODE)
+        return [f"{n}:  {v['protocol'].upper()}  {v['host']}:{v['port']}  {v['topic']}" if v else f"{n}:  (none)"
+                for n, v in sorted(d.items())]
+
+    def do_list_services(self):
+        port = self.port.get()
+
+        def work():
+            lines = self._service_lines(port)
+            self.q.put(("services", lines))
+            self._say("Saved services:\n  " + "\n  ".join(lines))
+        self._say("\n▶ saved services")
+        self.answers = {}
+        self._start(work)
+
+    def _service_picked(self, _event=None):
+        sel = self.svc_list.curselection()
+        if sel:
+            name = self.svc_list.get(sel[0]).split(":")[0]
+            self.sname.delete(0, "end")
+            self.sname.insert(0, name)
 
     def do_delete_service(self):
         name = self.sname.get().strip() or "default"
@@ -363,6 +667,7 @@ class App(tk.Tk):
                           f'    raise ValueError("no service named " + {name!r})\n'
                           f'xnet.clear_cloud({pin!r}, {name!r})\nprint("XPY:1")',
                           lambda r: f"Service '{name}' deleted.")
+            self.after(2500, self.do_list_services)
 
     def do_cloud_test(self):
         name = self.sname.get().strip() or "default"
@@ -383,7 +688,7 @@ class App(tk.Tk):
         self.app_dir = self._row(s, "App folder", browse="dir", default=str(ROOT / "apps" / "dht11"))
         self._buttons(s, ("Build (sign)", self.do_build_app), ("Build + install", lambda: self.do_build_app(install=True)))
         self.xpk = self._row(s, "Package (.xpk)", browse="xpk")
-        self._buttons(s, ("Install", self.do_install))
+        self._buttons(s, ("Install", self.do_install), ("Publish app (over the air)", lambda: self.do_publish_app(self.xpk.get())))
         s = self._section(f, "On the board")
         r = ttk.Frame(s)
         r.pack(fill="x")
@@ -405,44 +710,84 @@ class App(tk.Tk):
     def _tab_firmware(self, f):
         s = self._section(f, "Flash over USB")
         self.fw_file = self._row(s, "Firmware file (.xfw/.bin)", browse="fw", default=str(BUILD / "micropython.bin"))
-        ttk.Label(s, text="Flash: writes the firmware only; identity, keys, apps and settings are kept.\n"
-                          "Erase + flash: wipes the whole board first; it must be provisioned again.").pack(anchor="w")
+        self.fw_addr = self._row(s, "Start address (optional)", width=12)
+        ttk.Label(s, text="Flash keeps identity, apps and settings; Erase wipes everything.\nStart address: empty = automatic, or write any file at that address (unchecked).").pack(anchor="w")
         self._buttons(s, ("Flash", lambda: self.do_flash(erase=False)),
-                      ("Erase + flash…", lambda: self.do_flash(erase=True)))
+                      ("Erase + flash…", lambda: self.do_flash(erase=True)),
+                      ("Erase board…", self.do_erase))
         self._tab_ota(f)
 
     def _tab_ota(self, f):
-        s = self._section(f, "Over the air (signed update over Wi-Fi, with self-test and rollback)")
+        s = self._section(f, "Sign a firmware for updates over the air (self-test and rollback on the board)",
+                          nav="Publish over the air")
         self.sign_file = self._row(s, "Firmware to sign (.bin)", browse="fw", default=str(BUILD / "micropython.bin"))
-        ttk.Label(s, text="Signs it with keys/fw_sign.pem into firmware.xfw, in the same folder. The version comes from\n"
-                          "modules/xfw/xfw.py: raise it before building, the board only accepts newer versions.").pack(anchor="w")
-        r = ttk.Frame(s)
-        r.pack(fill="x", pady=(6, 0))
-        ttk.Button(r, text="Sign firmware", command=self.do_sign).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="Start server", command=self.do_serve).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="Stop server", command=self.do_stop_serve).pack(side="left", padx=(0, 6))
-        ttk.Label(r, text="Server:").pack(side="left", padx=(6, 2))
-        self.srv_lbl = ttk.Label(r, text="stopped", style="Head.TLabel")
-        self.srv_lbl.pack(side="left")
-        self._buttons(s, ("Push update", lambda: self.run_cmd(ota.cmd_push, ota_port=8443)),
+        self.sign_version = self._row(s, "Version (older firmware only)", width=12)
+        ttk.Label(s, text="Signs it with keys/fw_sign.pem into firmware.xfw (same folder); boards accept only newer versions.").pack(anchor="w")
+        self._buttons(s, ("Publish firmware", self.do_sign),
                       ("Firmware status", lambda: self.run_cmd(ota.cmd_status)))
+        ttk.Label(s, text="Signs it and puts it on the update server (build/ota). Then announce it: change fw_update in ThingsBoard.").pack(anchor="w", pady=(4, 0))
+
+    def refresh_push_list(self):
+        self.push_list.delete(0, "end")
+        for p in self._ports():
+            self.push_list.insert("end", p)
+
+    def do_push_many(self):
+        ports = [self.push_list.get(i) for i in self.push_list.curselection()]
+        if not ports:
+            messagebox.showinfo("Push", "Select one or more boards in the list first.")
+            return
+        if self.srv_lbl.cget("text") == "stopped" and not messagebox.askyesno(
+                "Push", "The update server looks stopped. Push anyway?"):
+            return
+        self._say(f"\n▶ push update to {len(ports)} board(s): {', '.join(ports)}")
+        self.answers = {}
+
+        def work():
+            results = []
+            for p in ports:
+                self._say(f"\n── {p} ──")
+                try:
+                    r = ota.cmd_push(argparse.Namespace(port=p, ota_port=8443))
+                    results.append((p, r or "done"))
+                except SystemExit as e:
+                    results.append((p, f"failed: {e.code}"))
+                except Exception as e:
+                    results.append((p, f"failed: {e}"))
+            self._say("\nSummary:\n" + "\n".join(f"  {p}: {r}" for p, r in results))
+        self._start(work)
 
     def do_sign(self):
-        """Check the chosen .bin, then sign it into build/ota/firmware.xfw (as xpy_ota.py build)."""
-        import re
+        """Check the chosen .bin, find its version, then sign it into firmware.xfw next to it."""
         path = self.sign_file.get().strip()
+        typed = self.sign_version.get().strip()
         try:
-            if Path(path).read_bytes()[:4] == b"XFW1":
+            data = Path(path).read_bytes()
+            if data[:4] == b"XFW1":
                 raise ValueError("this is already a signed package (.xfw); choose the .bin")
             check_firmware(path)
-            version = re.search(r'VERSION\s*=\s*"([^"]+)"', ota.XFW.read_text()).group(1)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError) as e:
             messagebox.showerror("Sign firmware", f"{path}\n\nNot signed: {e}")
             return
-        if version.encode() not in Path(path).read_bytes() and not messagebox.askyesno(
-                "Sign firmware", f"The VERSION in xfw.py ({version}) is not inside this firmware.\n"
-                                 "Was it built after you changed the version? Sign it as " + version + " anyway?"):
-            return
+        tag = ota.firmware_tag(data)                    # the firmware's own label (xfw.TAG)
+        if tag:
+            board, version = tag
+            if typed and typed != version:
+                messagebox.showinfo("Sign firmware", f"This firmware says it is version {version}; "
+                                    f"that is used (not {typed}).")
+            where = "read from the firmware"
+        else:                                           # older firmware: no label inside
+            board, version = board_of(data), typed or (ota.source_tag() or (None, ""))[1]
+            if not version:
+                messagebox.showerror("Sign firmware", "This firmware has no version label (it was built "
+                                     "before the XPY-FW label).\nType its version in 'Version', e.g. 1.1.0.")
+                return
+            if version.encode() not in data and not messagebox.askyesno(
+                    "Sign firmware", f"Version {version} does not appear inside this firmware.\n"
+                                     "Was it built with that version? Sign it as " + version + " anyway?"):
+                return
+            where = "typed" if typed else "from xfw.py"
+        self._say(f"Version {version} for {board} ({where})")
 
         def work():
             old = ota.IMAGE, ota.OTA_DIR
@@ -450,11 +795,16 @@ class App(tk.Tk):
             ota.OTA_DIR = Path(path).parent         # ... into firmware.xfw next to it
             try:
                 ota.cmd_build(argparse.Namespace(key=str(ota.FW_KEY), tamper_after=False,
-                                                 tamper_before=False, variant=""))
-                self.ota_dir = Path(path).parent    # the server will offer this one
+                                                 tamper_before=False, variant="",
+                                                 board=board, version=version))
             finally:
                 ota.IMAGE, ota.OTA_DIR = old
-        self._say(f"\n▶ sign firmware: {path}")
+            signed = Path(path).parent / "firmware.xfw"
+            board_, version_, dest = ota.publish_firmware(signed)   # build/ota/firmware/<BOARD>.xfw
+            self.q.put(("published",))
+            self._say(f"Published firmware {version} for {board}: {dest}\n"
+                      "Boards fetch it at their next check; to announce it now, change fw_update in ThingsBoard.")
+        self._say(f"\n▶ publish firmware: {path}")
         self.answers = {}
         self._start(work)
 
@@ -527,10 +877,31 @@ class App(tk.Tk):
                     elif item[0] == "xpk":
                         self.xpk.delete(0, "end")
                         self.xpk.insert(0, item[1])
+                    elif item[0] in ("services", "devices"):
+                        box = self.svc_list if item[0] == "services" else self.dev_list
+                        box.delete(0, "end")
+                        for line in item[1]:
+                            box.insert("end", line)
+                    elif item[0] == "gw_id":
+                        self.gw_id.delete(0, "end")
+                        self.gw_id.insert(0, item[1])
                     elif item[0] == "server":
                         self.srv_lbl.configure(text=item[1])
+                    elif item[0] == "wifi_scan":
+                        self.scan_list.delete(*self.scan_list.get_children())
+                        for n in item[1]:
+                            self.scan_list.insert("", "end", values=(n["ssid"], f"{n['rssi']} dBm", n["security"],
+                                                                     "★ yes" if n["saved"] else ""))
+                    elif item[0] == "wifi_saved":
+                        self.saved_list.delete(0, "end")
+                        for name in item[1]:
+                            self.saved_list.insert("end", name)
+                    elif item[0] == "published":
+                        self.refresh_published()
                 else:
                     self.log.insert("end", item)
+                    if not self.log_shown:              # new output while hidden: say so on the button
+                        self.out_btn.configure(text="Show output •")
                     self.log.see("end")
         except queue.Empty:
             pass
@@ -611,24 +982,130 @@ class App(tk.Tk):
                                                 "Continue?", icon="warning"):
             self.run_cmd(officer.cmd_reset, pin=True, answers={"type reset": "RESET"})
 
-    def do_wifi(self):
-        if not self._need_pin() or not self.ssid.get():
-            return
-        port, pin, ssid, pw, broker = self.port.get(), self.pin.get(), self.ssid.get(), self.wpass.get(), self.broker.get()
+    def _wifi_picked(self, _e=None):
+        sel = self.scan_list.selection()
+        if sel:
+            self.ssid.delete(0, "end")
+            self.ssid.insert(0, self.scan_list.item(sel[0], "values")[0])
+            self.wpass.delete(0, "end")
+            self.wpass.focus_set()
+
+    def do_wifi_scan(self):
+        port = self.port.get()
 
         def work():
-            ca = b""
-            if broker:                                  # local broker: its CA from server/ca.crt
-                from cryptography import x509
-                from cryptography.hazmat.primitives import serialization
-                c = x509.load_pem_x509_certificate((ROOT / "server" / "ca.crt").read_bytes())
-                ca = c.public_bytes(serialization.Encoding.DER)
-            officer.run(port, "import xnet\n"
-                        f"xnet.configure({pin!r}, {ssid!r}, {pw!r}, {broker!r}, 8883, bytes.fromhex({ca.hex()!r}))\n"
-                        'print("XPY:1")')
-            self._say(f"Wi-Fi saved on the board (sealed): {ssid}")
-        self._say("\n▶ Wi-Fi")
+            nets = officer.wifi_scan(port)
+            self.q.put(("wifi_scan", nets))
+            self._say(f"{len(nets)} networks in range"
+                      + (", saved ones: " + ", ".join(n["ssid"] for n in nets if n["saved"])
+                         if any(n["saved"] for n in nets) else ", none of them saved"))
+        self._say("\n▶ Wi-Fi scan (by the board)")
         self._start(work)
+
+    def do_wifi_saved(self):
+        port = self.port.get()
+
+        def work():
+            names = officer.wifi_saved(port)
+            self.q.put(("wifi_saved", names))
+            self._say("Saved: " + (", ".join(names) or "none"))
+        self._say("\n▶ saved Wi-Fi networks")
+        self._start(work)
+
+    def _say_wifi(self, st):
+        if st.get("connected"):
+            self._say(f"Connected to {st['ssid']}, IP {st['ip']}" + (f", {st['rssi']} dBm" if "rssi" in st else ""))
+        else:
+            self._say("Not connected.")
+
+    def do_wifi(self):
+        """Save the network typed/selected (sealed) and connect to it."""
+        if not self._need_pin() or not self.ssid.get().strip():
+            if not self.ssid.get().strip():
+                messagebox.showinfo("Wi-Fi", "Scan and select a network, or type its name.")
+            return
+        port, pin, ssid, pw, broker = (self.port.get(), self.pin.get(), self.ssid.get().strip(),
+                                       self.wpass.get(), self.broker.get().strip())
+
+        def work():
+            if broker:                                  # also save the local broker (its CA: server/ca.crt)
+                officer.run(port, "import xnet\n"
+                            f"xnet.configure({pin!r}, {ssid!r}, {pw!r}, {broker!r}, 8883, "
+                            f"bytes.fromhex({self._broker_ca().hex()!r}))\n"
+                            'print("XPY:1")')
+                names = officer.wifi_saved(port)
+            else:
+                names = officer.wifi_add(port, pin, ssid, pw)
+            self.q.put(("wifi_saved", names))
+            self._say(f"Saved (sealed): {ssid}. Saved networks: {', '.join(names)}")
+            try:
+                self._say_wifi(officer.wifi_connect(port, ssid))
+            except officer.DeviceError as e:
+                self._say(f"Saved, but could not connect now: {e}")
+        self._say("\n▶ save + connect Wi-Fi")
+        self._start(work)
+
+    def do_wifi_connect(self):
+        port = self.port.get()
+
+        def work():
+            self._say_wifi(officer.wifi_connect(port))
+        self._say("\n▶ connect to the best saved Wi-Fi in range")
+        self._start(work)
+
+    def do_wifi_remove(self):
+        sel = self.saved_list.curselection()
+        if not sel:
+            messagebox.showinfo("Wi-Fi", "Click 'Show saved', then select a saved network.")
+            return
+        if not self._need_pin():
+            return
+        ssid = self.saved_list.get(sel[0])
+        if not messagebox.askyesno("Wi-Fi", f"Delete the saved network '{ssid}' from the board?"):
+            return
+        port, pin = self.port.get(), self.pin.get()
+
+        def work():
+            names = officer.wifi_remove(port, pin, ssid)
+            self.q.put(("wifi_saved", names))
+            self._say(f"Deleted {ssid}. Saved networks: {', '.join(names) or 'none'}")
+        self._say("\n▶ delete saved Wi-Fi")
+        self._start(work)
+
+    def _broker_ca(self):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        c = x509.load_pem_x509_certificate((ROOT / "server" / "ca.crt").read_bytes())
+        return c.public_bytes(serialization.Encoding.DER)
+
+    def do_broker(self):
+        """Save only the local broker IP (the saved Wi-Fi networks stay)."""
+        if not self._need_pin():
+            return
+        port, pin, broker = self.port.get(), self.pin.get(), self.broker.get().strip()
+
+        def work():
+            ca = self._broker_ca() if broker else b""
+            officer.run(port, "import xnet\n"
+                        f"xnet.configure({pin!r}, '', '', {broker!r}, 8883, bytes.fromhex({ca.hex()!r}))\n"
+                        'print("XPY:1")')
+            self._say(f"Local broker saved (sealed): {broker or 'none'}")
+        self._say("\n▶ local broker")
+        self._start(work)
+
+    def _apply_preset(self):
+        p = PRESETS[self.preset.get()]
+        self.proto.set(p["protocol"])
+        self._show_protocol()
+        self.header.configure(state="normal")
+        if p.get("name"):
+            self.sname.delete(0, "end")
+            self.sname.insert(0, p["name"])
+        for entry, key in ((self.host, "host"), (self.bport, "port"), (self.topic, "topic"),
+                           (self.fields, "fields"), (self.header, "header")):
+            entry.delete(0, "end")
+            entry.insert(0, p[key])
+        self._show_protocol()
 
     def _protocol_changed(self):
         """Show the protocol's login fields and its standard port (if a standard one was set)."""
@@ -741,7 +1218,8 @@ class App(tk.Tk):
                                     ("topic", vals["topic"] and "<" not in vals["topic"]),
                                     ("CA certificate", vals["ca"])) if not ok]
         if problems:
-            messagebox.showwarning("Cloud service", "Fill in: " + ", ".join(problems))
+            messagebox.showwarning("Cloud service", "Fill in: " + ", ".join(problems) +
+                                   "\n(replace the <...> parts of a preset with your own values)")
             return
         port, pin = self.port.get(), self.pin.get()
         name = self.sname.get().strip() or "default"
@@ -750,6 +1228,7 @@ class App(tk.Tk):
             officer.save_cloud(port, pin, vals["host"], vals["bport"], officer.load_ca(vals["ca"]),
                                vals["topic"], vals["cid"], vals["user"], vals["bpass"], vals["fields"],
                                proto, vals["key"], vals["header"], name)
+            self.q.put(("services", self._service_lines(port)))
         self._say("\n▶ save cloud service")
         self._start(work)
 
@@ -813,16 +1292,42 @@ class App(tk.Tk):
     def do_flash(self, erase):
         """Flash a checked firmware file over USB (after erasing the whole chip, if asked)."""
         port, path = self.port.get(), self.fw_file.get().strip()
+        addr = self.fw_addr.get().strip()
+        if addr:                                    # any file at a given address, unchecked
+            if erase:
+                messagebox.showinfo("Erase + flash", "Erase + flash uses the automatic addresses.\n"
+                                    "Clear 'Start address' first, or use 'Flash' to write one file.")
+                return
+            try:
+                at = int(addr, 0)
+                if at < 0 or at % 0x1000:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Flash", "Start address: a number like 0x0, 0x1000 or 0x8000 "
+                                     "(a multiple of 0x1000).")
+                return
+            if not Path(path).is_file():
+                messagebox.showerror("Flash", f"No such file: {path}")
+                return
+            size = Path(path).stat().st_size
+            if not messagebox.askyesno("Flash", f"Write {Path(path).name} ({size} bytes) at {hex(at)}, "
+                                       "without any check?\n\nA wrong file or address can stop the board "
+                                       "from starting (fix it with Erase + flash).", icon="warning"):
+                return
+            self._run_esptool(port, "auto", [["write_flash", hex(at), str(path)]],
+                              f"write {Path(path).name} at {hex(at)}")
+            return
         try:
-            image, desc = check_firmware(path)
+            image, desc, board = check_firmware(path)
         except (OSError, ValueError, KeyError) as e:
             messagebox.showerror("Firmware", f"{path}\n\nNot flashed: {e}")
             return
+        chip, boot_at = BOARDS[board]
         # An erased chip also needs the bootloader and the partition table: taken from the
-        # firmware's own folder first (e.g. on Windows), else from the last build
-        here = Path(path).parent
-        boot = next((p for p in (here / "bootloader.bin", BUILD / "bootloader" / "bootloader.bin") if p.exists()), None)
-        table = next((p for p in (here / "partition-table.bin", BUILD / "partition_table" / "partition-table.bin")
+        # firmware's own folder first (e.g. on Windows), else from that board's last build
+        here, build = Path(path).parent, build_dir(board)
+        boot = next((p for p in (here / "bootloader.bin", build / "bootloader" / "bootloader.bin") if p.exists()), None)
+        table = next((p for p in (here / "partition-table.bin", build / "partition_table" / "partition-table.bin")
                       if p.exists()), None)
         if erase:
             if not (boot and table):
@@ -835,21 +1340,35 @@ class App(tk.Tk):
                                        "\n\nContinue?", icon="warning"):
                 return
             steps = [["erase_flash"],
-                     ["write_flash", "0x1000", str(boot), "0x8000", str(table), hex(APP_ADDR), str(image)]]
+                     ["write_flash", hex(boot_at), str(boot), "0x8000", str(table), hex(APP_ADDR), str(image)]]
         else:
             if not messagebox.askyesno("Flash", f"{desc}\n\nFlash it? Identity, keys, apps and settings are kept."):
                 return
             # write slot ota_0, and clear "which slot boots" so the board starts this firmware
             steps = [["erase_region", hex(OTADATA[0]), hex(OTADATA[1])],
                      ["write_flash", hex(APP_ADDR), str(image)]]
+        self._run_esptool(port, chip, steps, f"{'erase + flash' if erase else 'flash'}: {path}\n  {desc}")
 
+    def do_erase(self):
+        """Wipe the whole flash (esptool erase_flash); the chip type is detected."""
+        port = self.port.get()
+        if not messagebox.askyesno("Erase board", f"ERASE the whole board on {port}?\n\n"
+                                   "Firmware, identity, keys, PIN, apps and settings are all deleted. "
+                                   "The board will not start until a firmware is flashed again "
+                                   "(use 'Erase + flash' or 'Flash' with the bootloader).", icon="warning"):
+            return
+        self._run_esptool(port, "auto", [["erase_flash"]], f"erase board on {port}",
+                          done="Finished OK. The board is empty: flash a firmware next.")
+
+    def _run_esptool(self, port, chip, steps, title, done="Finished OK. The board restarts with the new firmware."):
+        """Run esptool steps in the background ("auto" = let esptool detect the chip)."""
         def work():
             try:
                 import esptool                      # pip package (bundled in xpython.exe)
             except ImportError:
                 esptool = None
             for step in steps:
-                argv = ["--chip", "esp32", "--port", port] + step
+                argv = ["--chip", chip, "--port", port] + step   # esptool refuses a different chip
                 self._say("esptool " + " ".join(step[:1]))
                 if esptool is not None:
                     try:
@@ -866,18 +1385,99 @@ class App(tk.Tk):
                     if p.wait() != 0:
                         self._say(f"FAILED (exit code {p.returncode}).")
                         return
-            self._say("Finished OK. The board restarts with the new firmware.")
-        self._say(f"\n▶ {'erase + flash' if erase else 'flash'}: {path}\n  {desc}")
+            self._say(done)
+        self._say(f"\n▶ {title}")
         self.answers = {}
         self._start(work)
+
+    def do_publish_fw(self):
+        """Choose a built firmware (.bin), then sign and publish it (same as the Firmware tab)."""
+        p = filedialog.askopenfilename(initialdir=BUILD if BUILD.exists() else ROOT, title="Firmware to publish (.bin)",
+                                       filetypes=[("Firmware image", "*.bin"), ("All files", "*")])
+        if p:
+            self.sign_file.delete(0, "end")
+            self.sign_file.insert(0, p)
+            self.do_sign()
+
+    def do_publish_app(self, package=None):
+        """Put a signed app package on the update server. Boards that HAVE this app install
+        it at their next app check (if it is newer); boards without it ignore it."""
+        if not package:
+            package = filedialog.askopenfilename(initialdir=ROOT / "build" / "apps", title="App to publish (.xpk)",
+                                                 filetypes=[("xPython app", "*.xpk")])
+        if not package:
+            return
+        try:
+            app, version, dest = ota.publish_app(package)
+        except (OSError, ValueError, KeyError) as e:
+            messagebox.showerror("Publish app", f"{package}\n\nNot published: {e}")
+            return
+        self.refresh_published()
+        self._say(f"\n▶ publish app\nPublished {app} {version}: {dest}\n"
+                  "Boards that have this app install it at their next check; "
+                  "to announce it now, change app_update in ThingsBoard.")
+
+    def _published(self):
+        """[(kind, name, version, path)] on the update server."""
+        out = []
+        files = sorted((ota.OTA_DIR / "firmware").glob("*.xfw"))
+        legacy = ota.OTA_DIR / "firmware.xfw"
+        for fw in files + ([legacy] if legacy.exists() else []):
+            kind = "firmware" if fw != legacy else "firmware (older boards)"
+            try:
+                h = ota.xfw_header(fw)
+                board = h.get("board", "?")
+                if fw != legacy and fw.stem != board:
+                    board += " (wrong file name: not offered)"
+                out.append((kind, board, h.get("version", "?"), fw))
+            except (OSError, ValueError, struct.error):
+                out.append((kind, "?", "unreadable", fw))
+        for f in sorted((ota.OTA_DIR / "apps").glob("*.xpk")):
+            try:
+                app, version = ota.read_xpk(f)
+                name = app if f.stem == app else f"{app} (wrong file name: not offered)"
+            except (OSError, ValueError, KeyError):
+                name, version = f.stem, "unreadable"
+            out.append(("app", name, version, f))
+        return out
+
+    def refresh_published(self):
+        self.pub_list.delete(*self.pub_list.get_children())
+        for kind, name, version, path in self._published():
+            self.pub_list.insert("", "end", values=(kind, name, version, str(path)))
+
+    def do_unpublish(self):
+        sel = self.pub_list.selection()
+        if not sel:
+            messagebox.showinfo("Published", "Select a firmware or an app in the list first.")
+            return
+        kind, name, version, path = self.pub_list.item(sel[0], "values")
+        if not messagebox.askyesno("Remove", f"Remove {kind} {name} {version} from the update server?\n\n{path}\n\n"
+                                   "Boards that already installed it keep it; others will not get it."):
+            return
+        try:
+            Path(path).unlink()
+        except OSError as e:
+            messagebox.showerror("Remove", str(e))
+            return
+        self._say(f"\n▶ removed from the update server: {kind} {name} {version}")
+        self.refresh_published()
+
+    def do_show_published(self):
+        self.refresh_published()
+        lines = ["\n▶ published on the update server (" + str(ota.OTA_DIR) + ")"]
+        for kind, name, version, path in self._published():
+            lines.append(f"{kind}: {name} {version}")
+        if len(lines) == 1:
+            lines.append("nothing")
+        self._say("\n".join(lines))
 
     def do_serve(self):
         if self.server and self.server.poll() is None:
             return
-        folder = self.ota_dir or ota.OTA_DIR
-        if not (Path(folder) / "firmware.xfw").exists():
-            messagebox.showwarning("Server", f"There is no firmware.xfw in {folder}.\nClick 'Sign firmware' first.")
-            return
+        folder = ota.OTA_DIR                        # firmware.xfw + apps/ (Publish puts them there)
+        if not list((folder / "firmware").glob("*.xfw")) and not list((folder / "apps").glob("*.xpk")):
+            self._say(f"Note: nothing is published yet in {folder} (use Publish firmware / Publish app).")
         cmd = ([sys.executable, "--ota"] if FROZEN else [sys.executable, "-u", str(HERE / "tools/xpy-ota/xpy_ota.py")])
         self.server = subprocess.Popen(cmd + ["serve", "--dir", str(folder)],
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=ROOT)

@@ -1,4 +1,4 @@
-import json
+"""import json
 import time
 import dht
 import machine
@@ -19,5 +19,17 @@ def main():
             time.sleep(2)
     message = json.dumps({"temperature": d.temperature(), "humidity": d.humidity()})
     topic = xmsg.publish("telemetry", message)   # xnet sends it securely (TLS)
+    print("sent", message, "to", topic)
+    return message """
+import json
+import random
+import xmsg
+
+
+def main():
+    temperature = random.randint(20, 35)       # dummy value, °C
+    humidity = random.randint(40, 80)          # dummy value, %
+    message = json.dumps({"temperature": temperature, "humidity": humidity})
+    topic = xmsg.publish("telemetry", message)
     print("sent", message, "to", topic)
     return message

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1F2B4D"/><stop offset="1" stop-color="#0B1222"/>
+    </linearGradient>
+    <linearGradient id="sh" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/><stop offset="1" stop-color="#0D9488"/>
+    </linearGradient>
+  </defs>
+  <!-- chip body with pins -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+  <g fill="#5B6B8F">
+    <rect x="70" y="22" width="14" height="22" rx="4"/><rect x="121" y="22" width="14" height="22" rx="4"/><rect x="172" y="22" width="14" height="22" rx="4"/>
+    <rect x="70" y="212" width="14" height="22" rx="4"/><rect x="121" y="212" width="14" height="22" rx="4"/><rect x="172" y="212" width="14" height="22" rx="4"/>
+    <rect x="22" y="70" width="22" height="14" rx="4"/><rect x="22" y="121" width="22" height="14" rx="4"/><rect x="22" y="172" width="22" height="14" rx="4"/>
+    <rect x="212" y="70" width="22" height="14" rx="4"/><rect x="212" y="121" width="22" height="14" rx="4"/><rect x="212" y="172" width="22" height="14" rx="4"/>
+  </g>
+  <!-- shield -->
+  <path d="M128 50 L194 74 V128 C194 168 166 194 128 210 C90 194 62 168 62 128 V74 Z" fill="url(#sh)"/>
+  <path d="M128 50 L194 74 V128 C194 168 166 194 128 210 C90 194 62 168 62 128 V74 Z" fill="none" stroke="#99F6E4" stroke-opacity="0.55" stroke-width="4"/>
+  <!-- bold x -->
+  <g stroke="#FFFFFF" stroke-width="22" stroke-linecap="round">
+    <line x1="102" y1="100" x2="154" y2="158"/><line x1="154" y1="100" x2="102" y2="158"/>
+  </g>
+</svg>

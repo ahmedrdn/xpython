@@ -1,0 +1,6 @@
+{
+  "app_id": "blink_c62",
+  "version": "1.0.0",
+  "entry": "main.py",
+  "permissions": {"time_ms": 5000}
+}
